@@ -358,3 +358,16 @@ export function isInputZipStale(zipPath: string, remoteTimestamp: Date): boolean
     const mtime = fs.statSync(zipPath).mtime;
     return mtime < remoteTimestamp;
 }
+
+/** Milliseconds in the ACMA incremental update window. */
+const INCREMENTAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * True iff a full sync is required — either the DB has never been synced
+ * (`asOf` is null) or the gap to `remoteTimestamp` exceeds the 24-hour
+ * incremental update window. Equality counts as "still incremental".
+ */
+export function shouldDoFullSync(asOf: Date | null, remoteTimestamp: Date): boolean {
+    if (!asOf) return true;
+    return remoteTimestamp.getTime() - asOf.getTime() > INCREMENTAL_WINDOW_MS;
+}
