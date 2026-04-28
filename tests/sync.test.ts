@@ -122,6 +122,10 @@ describe('parseRemoteTimestamp', () => {
         expect(parseRemoteTimestamp('2026-03-05T06:00:00Z')).toBeNull();
     });
 
+    test('returns null on regex-valid but semantically invalid date', () => {
+        expect(parseRemoteTimestamp('2026-13-01 00:00:00')).toBeNull();
+    });
+
     test('returns null on empty string', () => {
         expect(parseRemoteTimestamp('')).toBeNull();
     });
