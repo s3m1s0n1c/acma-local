@@ -187,14 +187,51 @@ export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // Fetch remote timestamp once; reused below to decide full vs incremental
+    // and threaded through performFullSync to avoid a second fetch.
+    let remoteTimestampRaw: string;
+    try {
+        const tsResponse = await axios.get(config.timestampUrl, { responseType: 'text' });
+        remoteTimestampRaw = String(tsResponse.data).trim();
+    } catch (e) {
+        console.error('[SYNC] Could not fetch remote timestamp; aborting sync.', e);
+        return;
+    }
+    const parsedRemote = parseRemoteTimestamp(remoteTimestampRaw);
+    if (!parsedRemote) {
+        console.log(`[SYNC] Could not parse remote timestamp '${remoteTimestampRaw}'; proceeding without staleness check.`);
+    }
+
     const dbExists = fs.existsSync(config.dbPath);
 
     if (!dbExists) {
-        await performFullSync(config);
+        await performFullSync(config, remoteTimestampRaw);
         return;
     }
 
-    // Check if we can do an incremental sync
+    // Read meta.as_of for gap check
+    let asOf: Date | null = null;
+    if (parsedRemote) {
+        const db = new Database(config.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            const row = db.prepare("SELECT value FROM meta WHERE key = 'as_of'").get() as { value: string } | undefined;
+            asOf = row ? parseRemoteTimestamp(row.value) : null;
+        } finally {
+            if (db.open) db.close();
+        }
+
+        if (shouldDoFullSync(asOf, parsedRemote)) {
+            const gapHours = asOf
+                ? Math.round((parsedRemote.getTime() - asOf.getTime()) / 3_600_000)
+                : null;
+            const gapDesc = gapHours === null ? 'no prior sync' : `${gapHours}h behind`;
+            console.log(`[SYNC] DB is ${gapDesc} (remote=${parsedRemote.toISOString()}); full sync required.`);
+            await performFullSync(config, remoteTimestampRaw);
+            return;
+        }
+    }
+
+    // Within the incremental window — attempt incremental sync
     console.log('Checking for incremental updates...');
     try {
         const response = await axios.get(config.incrementalUrl);
@@ -209,8 +246,10 @@ export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
             console.log(`Incremental sync successful. Database is now as-of ${newTimestamp}`);
         }
     } catch (e) {
-        console.error('Incremental sync failed, might need full sync or it is outside 24h window.', e);
-        // Fallback or just report error
+        console.error('Incremental sync failed.', e);
+        // No auto-fallback: the gap check above already routed any DB that
+        // is genuinely past the incremental window. Remaining failures are
+        // transient and will retry on the next scheduled sync.
     }
 }
 
