@@ -162,4 +162,10 @@ describe('isInputZipStale', () => {
         const remote = new Date('2026-03-05T06:00:00Z');
         expect(isInputZipStale(zipPath, remote)).toBe(false);
     });
+
+    test('returns false when zip mtime exactly equals remote timestamp (strict <)', () => {
+        const t = new Date('2026-03-05T06:00:00Z');
+        fs.utimesSync(zipPath, t, t);
+        expect(isInputZipStale(zipPath, t)).toBe(false);
+    });
 });
