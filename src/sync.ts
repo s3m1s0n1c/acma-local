@@ -215,6 +215,8 @@ export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
         const db = new Database(config.dbPath, { readonly: true, fileMustExist: true });
         try {
             const row = db.prepare("SELECT value FROM meta WHERE key = 'as_of'").get() as { value: string } | undefined;
+            // meta.as_of is written by performFullSync (raw remote timestamp) and
+            // applyIncrementalUpdate (-- TO: line); both produce YYYY-MM-DD HH:MM:SS today.
             asOf = row ? parseRemoteTimestamp(row.value) : null;
         } finally {
             if (db.open) db.close();
