@@ -55,7 +55,7 @@ async function downloadFile(url: string, targetPath: string): Promise<void> {
 /**
  * Performs a full synchronization: download, extract, and import all data.
  */
-export async function performFullSync(config: SyncConfig): Promise<void> {
+export async function performFullSync(config: SyncConfig, remoteTimestampRaw?: string): Promise<void> {
     if (currentSyncStatus.isSyncing) {
         throw new Error('Synchronization already in progress');
     }
@@ -67,19 +67,32 @@ export async function performFullSync(config: SyncConfig): Promise<void> {
             fs.mkdirSync(config.dataDir, { recursive: true });
         }
 
-        console.log('Fetching dataset timestamp...');
-        const tsResponse = await axios.get(config.timestampUrl, { responseType: 'text' });
-        const remoteTimestamp = String(tsResponse.data).trim();
+        let remoteTimestamp: string;
+        if (remoteTimestampRaw !== undefined) {
+            remoteTimestamp = remoteTimestampRaw;
+        } else {
+            console.log('Fetching dataset timestamp...');
+            const tsResponse = await axios.get(config.timestampUrl, { responseType: 'text' });
+            remoteTimestamp = String(tsResponse.data).trim();
+        }
 
         const zipPathFromInput = '/projects/acma-local-redux/inputs/spectra_rrl.zip';
         const zipPath = path.join(config.dataDir, 'spectra_rrl.zip');
 
         currentSyncStatus.progress = 5;
 
-        if (fs.existsSync(zipPathFromInput)) {
+        const parsedRemote = parseRemoteTimestamp(remoteTimestamp);
+        const inputZipExists = fs.existsSync(zipPathFromInput);
+        const inputZipUsable = inputZipExists && !(parsedRemote && isInputZipStale(zipPathFromInput, parsedRemote));
+
+        if (inputZipUsable) {
             console.log('Using local dataset from inputs/');
             fs.copyFileSync(zipPathFromInput, zipPath);
         } else {
+            if (inputZipExists && parsedRemote) {
+                const mtime = fs.statSync(zipPathFromInput).mtime.toISOString();
+                console.log(`[SYNC] Input zip mtime=${mtime} is older than remote=${parsedRemote.toISOString()}; ignoring stale input.`);
+            }
             console.log('Downloading full dataset...');
             await downloadFile(config.datasetUrl, zipPath);
         }
