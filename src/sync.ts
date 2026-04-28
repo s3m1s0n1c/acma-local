@@ -347,3 +347,14 @@ export function parseRemoteTimestamp(s: string): Date | null {
     const d = new Date(iso);
     return isNaN(d.getTime()) ? null : d;
 }
+
+/**
+ * True iff the file at `zipPath` exists AND its mtime is earlier than
+ * `remoteTimestamp`. Returns false if the file is missing — the caller
+ * decides whether that means "download" or "error".
+ */
+export function isInputZipStale(zipPath: string, remoteTimestamp: Date): boolean {
+    if (!fs.existsSync(zipPath)) return false;
+    const mtime = fs.statSync(zipPath).mtime;
+    return mtime < remoteTimestamp;
+}

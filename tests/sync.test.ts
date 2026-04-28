@@ -1,4 +1,4 @@
-import { extractZip, importCsv, applyIncrementalUpdate, parseRemoteTimestamp } from '../src/sync';
+import { extractZip, importCsv, applyIncrementalUpdate, parseRemoteTimestamp, isInputZipStale } from '../src/sync';
 import { initializeDatabase } from '../src/db';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -128,5 +128,38 @@ describe('parseRemoteTimestamp', () => {
 
     test('returns null on empty string', () => {
         expect(parseRemoteTimestamp('')).toBeNull();
+    });
+});
+
+describe('isInputZipStale', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_stale');
+    const zipPath = path.join(scratchDir, 'sample.zip');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        fs.writeFileSync(zipPath, 'placeholder');
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('returns false when zip is missing', () => {
+        const remote = new Date('2026-03-05T06:00:00Z');
+        expect(isInputZipStale(path.join(scratchDir, 'does-not-exist.zip'), remote)).toBe(false);
+    });
+
+    test('returns true when zip mtime is older than remote timestamp', () => {
+        const oldTime = new Date('2025-01-01T00:00:00Z');
+        fs.utimesSync(zipPath, oldTime, oldTime);
+        const remote = new Date('2026-03-05T06:00:00Z');
+        expect(isInputZipStale(zipPath, remote)).toBe(true);
+    });
+
+    test('returns false when zip mtime is newer than remote timestamp', () => {
+        const newTime = new Date('2026-04-01T00:00:00Z');
+        fs.utimesSync(zipPath, newTime, newTime);
+        const remote = new Date('2026-03-05T06:00:00Z');
+        expect(isInputZipStale(zipPath, remote)).toBe(false);
     });
 });
