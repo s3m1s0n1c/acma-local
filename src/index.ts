@@ -3,7 +3,8 @@
  *
  * Per-session StreamableHTTPServerTransport (official MCP multi-client pattern).
  * Full tool catalog: search_sites, search_licences, search_clients,
- *                    get_licence_details, get_site_details, sync_data.
+ *                    get_licence_details, get_site_details, sync_data,
+ *                    execute_sql, list_sample_queries, export_kml.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -23,9 +24,48 @@ import {
     getSiteDetails,
 } from './logic.js';
 import { executeSqlWithTimeout, listSampleQueries } from './sql.js';
+import { generateKml } from './kml.js';
 
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
 const PORT = process.env.PORT || 3000;
+
+// ─── Result Cache ────────────────────────────────────────────────────────────
+// Caches query results (columns + rows) so KML can be generated on demand
+// without re-running the query. 30-minute TTL.
+
+interface CachedResult {
+    columns: string[];
+    rows: unknown[][];
+    expires: number;
+}
+
+const resultCache = new Map<string, CachedResult>();
+
+function cacheResult(columns: string[], rows: unknown[][]): string {
+    const id = randomUUID();
+    resultCache.set(id, { columns, rows, expires: Date.now() + 30 * 60 * 1000 });
+    return id;
+}
+
+// Cleanup expired results every 5 mins
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of resultCache.entries()) {
+        if (now > entry.expires) resultCache.delete(id);
+    }
+}, 300_000).unref();
+
+/**
+ * Detects whether a result set contains geospatial data (lat/lng or geometry columns).
+ */
+function hasGeospatialData(columns: string[]): boolean {
+    const lCols = columns.map(c => c.toLowerCase());
+    const hasLatLng = lCols.includes('latitude') && lCols.includes('longitude');
+    const hasGeometry = lCols.includes('geometry');
+    return hasLatLng || hasGeometry;
+}
+
+// ─── DB Helper ───────────────────────────────────────────────────────────────
 
 function openDb() {
     return new Database(dbPath, { readonly: true });
@@ -33,7 +73,7 @@ function openDb() {
 
 function createServer(): Server {
     const server = new Server(
-        { name: 'acma-rrl-server', version: '1.4.0' },
+        { name: 'acma-rrl-server', version: '1.5.0' },
         { capabilities: { tools: {} } }
     );
 
@@ -70,7 +110,8 @@ Get full details for a specific licence: client info and all associated radio de
 
 ## Usage
 - Use after finding a licence number via search_licences
-- Returns: licence record, client/owner info, up to 50 device records
+- Returns: licence record, client/owner info, up to 50 device records (with site coordinates)
+- If results contain geospatial data, a result_id is returned for optional KML export via export_kml
 
 ## Input
 - licence_no: Exact licence number (e.g. "1191324/1")`,
@@ -91,6 +132,7 @@ Search transmission sites by site name or postcode.
 ## Usage
 - Use when asked about a transmitter location or site
 - Results include: SITE_ID, NAME, STATE, POSTCODE, LATITUDE, LONGITUDE
+- A result_id is returned for optional KML export via export_kml
 
 ## Input
 - query: Site name or postcode`,
@@ -112,6 +154,7 @@ Get full details for a specific site including all devices registered at that si
 ## Usage
 - Use after finding a SITE_ID via search_sites
 - Returns: site record, up to 50 associated device_details records
+- A result_id is returned for optional KML export via export_kml
 
 ## Input
 - site_id: Exact Site ID from site search results`,
@@ -184,6 +227,7 @@ Run a read-only SELECT query directly against the ACMA RRL SQLite database.
 - Use list_sample_queries first if unsure what to query
 - Only SELECT statements are allowed — no INSERT, UPDATE, DELETE, DROP etc.
 - Results capped at 'limit' rows (default 100, max 500)
+- If results contain geospatial columns (LATITUDE/LONGITUDE or GEOMETRY), a result_id is returned for optional KML export via export_kml
 
 ## Available tables
 client, licence, site, device_details, antenna, antenna_pattern, antenna_polarity,
@@ -193,7 +237,7 @@ licence_service, licence_status, licence_subservice, licensing_area,
 nature_of_service, reports_text_block, satellite, meta
 
 ## Output
-{ columns: string[], rows: any[][], truncated: boolean, rowCount: number }`,
+{ columns: string[], rows: any[][], truncated: boolean, rowCount: number, result_id?: string }`,
                 inputSchema: {
                     type: 'object',
                     properties: {
@@ -207,6 +251,28 @@ nature_of_service, reports_text_block, satellite, meta
                         },
                     },
                     required: ['sql'],
+                },
+            },
+            {
+                name: 'export_kml',
+                description: `
+### [KML Export]
+Generate a KML file from cached query results.
+
+## Usage
+- Call this AFTER running a query that returned a result_id (e.g. execute_sql, search_sites, get_site_details, get_licence_details)
+- Pass the result_id from the previous query response
+- Returns full KML XML content ready for use in Google Earth or any KML viewer
+- Results are cached for 30 minutes after the original query
+
+## Input
+- result_id: The result_id returned by a previous query tool`,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        result_id: { type: 'string', description: 'The result_id from a previous query response' },
+                    },
+                    required: ['result_id'],
                 },
             },
         ],
@@ -230,7 +296,21 @@ nature_of_service, reports_text_block, satellite, meta
             try {
                 const result = getLicenceDetails(db, args?.licence_no as string);
                 if (!result) return { content: [{ type: 'text', text: `No licence found for: ${args?.licence_no}` }] };
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+
+                // Cache devices for potential KML export (devices now include site coords)
+                let resultId: string | undefined;
+                if (result.devices.length > 0) {
+                    const columns = Object.keys(result.devices[0] as object);
+                    if (hasGeospatialData(columns)) {
+                        const rows = result.devices.map(r => columns.map(c => (r as any)[c]));
+                        resultId = cacheResult(columns, rows);
+                    }
+                }
+
+                const response: any = { ...result };
+                if (resultId) response.result_id = resultId;
+
+                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -238,7 +318,19 @@ nature_of_service, reports_text_block, satellite, meta
             const db = openDb();
             try {
                 const results = searchSites(db, args?.query as string, (args?.limit as number) ?? 10);
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+
+                // Cache results for potential KML export
+                let resultId: string | undefined;
+                if (results.length > 0) {
+                    const columns = Object.keys(results[0] as object);
+                    if (hasGeospatialData(columns)) {
+                        const rows = results.map(r => columns.map(c => (r as any)[c]));
+                        resultId = cacheResult(columns, rows);
+                    }
+                }
+
+                const response: any = { results, result_id: resultId };
+                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -247,7 +339,19 @@ nature_of_service, reports_text_block, satellite, meta
             try {
                 const result = getSiteDetails(db, args?.site_id as string);
                 if (!result) return { content: [{ type: 'text', text: `No site found for ID: ${args?.site_id}` }] };
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+
+                // Cache site record for potential KML export
+                let resultId: string | undefined;
+                const columns = Object.keys(result.site as object);
+                if (hasGeospatialData(columns)) {
+                    const rows = [columns.map(c => (result.site as any)[c])];
+                    resultId = cacheResult(columns, rows);
+                }
+
+                const response: any = { ...result };
+                if (resultId) response.result_id = resultId;
+
+                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -261,16 +365,24 @@ nature_of_service, reports_text_block, satellite, meta
 
         if (name === 'sync_data') {
             const status = getSyncStatus();
+            const decisionLine = status.reason
+                ? `Last decision: ${status.mode ? `${status.mode} sync — ` : ''}${status.reason}` +
+                  (status.detail ? ` (${status.detail})` : '') +
+                  (status.lastDecisionAt ? ` at ${status.lastDecisionAt}` : '')
+                : null;
+
             if (status.isSyncing) {
-                return {
-                    content: [{
-                        type: 'text',
-                        text: `Sync in progress: ${status.progress}% — step: ${status.currentTable ?? 'Initializing'}. Poll again soon.`
-                    }]
-                };
+                const lines = [
+                    `Sync in progress${status.mode ? ` (${status.mode})` : ''}: ${status.progress}% — step: ${status.currentTable ?? 'Initializing'}.`,
+                    'Poll sync_data again soon.',
+                ];
+                if (decisionLine) lines.push(decisionLine);
+                return { content: [{ type: 'text', text: lines.join('\n') }] };
             }
             sync(DEFAULT_CONFIG).catch(err => console.error('[SYNC] Error:', err));
-            return { content: [{ type: 'text', text: 'Sync started. Call sync_data again to check progress.' }] };
+            const lines = ['Sync started. Call sync_data again to check progress.'];
+            if (decisionLine) lines.push(`Previous run — ${decisionLine}`);
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
         }
 
         if (name === 'list_sample_queries') {
@@ -283,13 +395,44 @@ nature_of_service, reports_text_block, satellite, meta
             const limit = (args?.limit as number) ?? 100;
             try {
                 const result = await executeSqlWithTimeout(dbPath, sql, limit, 25_000);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+
+                // Cache results for potential KML export if geospatial data detected
+                let resultId: string | undefined;
+                if (result.rowCount > 0 && hasGeospatialData(result.columns)) {
+                    resultId = cacheResult(result.columns, result.rows);
+                }
+
+                const response: any = { ...result };
+                if (resultId) response.result_id = resultId;
+
+                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
             } catch (err: any) {
                 return {
                     content: [{ type: 'text', text: `SQL Error: ${err.message}` }],
                     isError: true,
                 };
             }
+        }
+
+        if (name === 'export_kml') {
+            const id = args?.result_id as string;
+            if (!id) {
+                return {
+                    content: [{ type: 'text', text: 'Missing required parameter: result_id' }],
+                    isError: true,
+                };
+            }
+            const entry = resultCache.get(id);
+            if (!entry) {
+                return {
+                    content: [{ type: 'text', text: `Result not found or expired (result_id: ${id}). Please re-run the original query to get a fresh result_id.` }],
+                    isError: true,
+                };
+            }
+            const kml = generateKml(entry.columns, entry.rows);
+            return {
+                content: [{ type: 'text', text: kml }]
+            };
         }
 
         return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
@@ -343,7 +486,7 @@ async function main() {
                 }
             };
 
-            await createServer().connect(transport);
+            await createServer().connect(transport as any);
 
             try {
                 await transport.handleRequest(req, res, req.body);
@@ -361,8 +504,8 @@ async function main() {
 
     const port = Number(PORT);
     app.listen(port, '0.0.0.0', () => {
-        console.error(`ACMA RRL MCP Server v1.5.0 running on port ${port} at http://localhost:${port}/mcp`);
-        console.error('Tools: search_licences, get_licence_details, search_sites, get_site_details, search_clients, sync_data, execute_sql, list_sample_queries');
+        console.error(`ACMA RRL MCP Server v1.6.0 running on port ${port} at http://localhost:${port}/mcp`);
+        console.error('Tools: search_licences, get_licence_details, search_sites, get_site_details, search_clients, sync_data, execute_sql, list_sample_queries, export_kml');
     });
 }
 

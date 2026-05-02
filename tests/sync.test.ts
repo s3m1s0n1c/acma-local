@@ -1,4 +1,4 @@
-import { extractZip, importCsv, applyIncrementalUpdate } from '../src/sync';
+import { extractZip, importCsv, applyIncrementalUpdate, parseRemoteTimestamp, isInputZipStale, shouldDoFullSync } from '../src/sync';
 import { initializeDatabase } from '../src/db';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -100,5 +100,117 @@ describe('Sync Logic - CSV Import', () => {
         expect(client).toBeDefined();
         expect(client.LICENCEE).toBe('Test Corp');
         db.close();
+    });
+});
+
+describe('parseRemoteTimestamp', () => {
+    test('parses well-formed ACMA timestamp as UTC', () => {
+        const d = parseRemoteTimestamp('2026-03-05 06:00:00');
+        expect(d).not.toBeNull();
+        expect(d!.toISOString()).toBe('2026-03-05T06:00:00.000Z');
+    });
+
+    test('tolerates surrounding whitespace and trailing newline', () => {
+        const d = parseRemoteTimestamp('  2026-03-05 06:00:00\n');
+        expect(d).not.toBeNull();
+        expect(d!.toISOString()).toBe('2026-03-05T06:00:00.000Z');
+    });
+
+    test('returns null on malformed input', () => {
+        expect(parseRemoteTimestamp('not a date')).toBeNull();
+        expect(parseRemoteTimestamp('2026/03/05 06:00:00')).toBeNull();
+        expect(parseRemoteTimestamp('2026-03-05T06:00:00Z')).toBeNull();
+    });
+
+    test('returns null on regex-valid but semantically invalid date', () => {
+        expect(parseRemoteTimestamp('2026-13-01 00:00:00')).toBeNull();
+    });
+
+    test('returns null on empty string', () => {
+        expect(parseRemoteTimestamp('')).toBeNull();
+    });
+
+    test('parses compact YYYYMMDDHHMMSS form (no sub-seconds)', () => {
+        const d = parseRemoteTimestamp('20260305060000');
+        expect(d).not.toBeNull();
+        expect(d!.toISOString()).toBe('2026-03-05T06:00:00.000Z');
+    });
+
+    test('parses compact form with trailing nanosecond digits (real production shape)', () => {
+        // Mirror of the value observed in data/acma.db meta.as_of after a real sync.
+        const d = parseRemoteTimestamp('20260305234922793617000');
+        expect(d).not.toBeNull();
+        expect(d!.toISOString()).toBe('2026-03-05T23:49:22.000Z');
+    });
+
+    test('returns null on compact form with semantically invalid components', () => {
+        expect(parseRemoteTimestamp('20261301000000')).toBeNull();
+    });
+});
+
+describe('isInputZipStale', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_stale');
+    const zipPath = path.join(scratchDir, 'sample.zip');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        fs.writeFileSync(zipPath, 'placeholder');
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('returns false when zip is missing', () => {
+        const remote = new Date('2026-03-05T06:00:00Z');
+        expect(isInputZipStale(path.join(scratchDir, 'does-not-exist.zip'), remote)).toBe(false);
+    });
+
+    test('returns true when zip mtime is older than remote timestamp', () => {
+        const oldTime = new Date('2025-01-01T00:00:00Z');
+        fs.utimesSync(zipPath, oldTime, oldTime);
+        const remote = new Date('2026-03-05T06:00:00Z');
+        expect(isInputZipStale(zipPath, remote)).toBe(true);
+    });
+
+    test('returns false when zip mtime is newer than remote timestamp', () => {
+        const newTime = new Date('2026-04-01T00:00:00Z');
+        fs.utimesSync(zipPath, newTime, newTime);
+        const remote = new Date('2026-03-05T06:00:00Z');
+        expect(isInputZipStale(zipPath, remote)).toBe(false);
+    });
+
+    test('returns false when zip mtime exactly equals remote timestamp (strict <)', () => {
+        const t = new Date('2026-03-05T06:00:00Z');
+        fs.utimesSync(zipPath, t, t);
+        expect(isInputZipStale(zipPath, t)).toBe(false);
+    });
+});
+
+describe('shouldDoFullSync', () => {
+    const remote = new Date('2026-04-28T00:00:00Z');
+
+    test('returns true when asOf is null (no DB / never synced)', () => {
+        expect(shouldDoFullSync(null, remote)).toBe(true);
+    });
+
+    test('returns false when gap is under 24h', () => {
+        const asOf = new Date('2026-04-27T05:00:00Z'); // 19h behind
+        expect(shouldDoFullSync(asOf, remote)).toBe(false);
+    });
+
+    test('returns true when gap is over 24h', () => {
+        const asOf = new Date('2026-04-26T00:00:00Z'); // 48h behind
+        expect(shouldDoFullSync(asOf, remote)).toBe(true);
+    });
+
+    test('returns false when gap is exactly 24h (boundary: <= 24h is incremental)', () => {
+        const asOf = new Date('2026-04-27T00:00:00Z'); // exactly 24h
+        expect(shouldDoFullSync(asOf, remote)).toBe(false);
+    });
+
+    test('returns false when asOf is in the future relative to remote', () => {
+        const asOf = new Date('2026-04-28T01:00:00Z');
+        expect(shouldDoFullSync(asOf, remote)).toBe(false);
     });
 });
