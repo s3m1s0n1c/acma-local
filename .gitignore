@@ -7,3 +7,9 @@ dist/
 *.zip
 *.rrl_update
 extracted/
+tmp/
+fresh/
+compare/
+*.js.diff
+offline_rrl*.js
+
