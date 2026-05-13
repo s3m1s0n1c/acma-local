@@ -70,7 +70,23 @@ Based on Australian Communications and Media Authority information.
 
 This project provides a local mirror of the [ACMA Register of Radiocommunications Licences (RRL)](https://www.acma.gov.au/radiocomms-licence-data). 
 
-The server implementation is based on the logic and data structures of the [ACMA Offline RRL](https://web.acma.gov.au/offline-rrl/index.html) web application. The core logic for data synchronization and SQL query generation was reverse-engineered from the original ACMA JavaScript implementation to ensure compatibility and accuracy.
+The server implementation now consumes ACMA's `/v1/Extracts` REST endpoint
+(`https://backend.acma.gov.au/rrl/v1/Extracts`) as its source of truth for
+both the full dataset and daily incremental updates. The legacy
+`offline-rrl` JavaScript implementation was used to reverse-engineer the
+data structures and SQL query patterns; the new manifest API replaces the
+legacy 3-URL pipeline (`spectra_rrl.zip` + `datetime-of-extract.txt` +
+`.rrl_update` SQL diff).
+
+Synchronisation modes (exposed via the MCP `sync_data` tool):
+
+- **`auto`** (default): fetches the manifest and applies any daily
+  CSV-diff change-zips strictly newer than the local `meta.as_of`. Never
+  pulls the full 70 MB extract on its own — safe to call from mobile or
+  metered networks.
+- **`full`**: force-downloads and reimports `spectra_rrl.zip`. Use this
+  on first install or when `sync_data` reports `gap-exceeded` (the local
+  DB is older than the manifest's ~3-day incremental window).
 
 ## License
 

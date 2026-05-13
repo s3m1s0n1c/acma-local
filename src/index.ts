@@ -382,12 +382,15 @@ Generate a KML file from cached query results.
         if (name === 'sync_data') {
             // Trigger the sync (mode defaults to 'auto'). Fire-and-forget; the
             // user polls by calling sync_data again to read getSyncStatus().
-            const mode = (args as any)?.mode === 'full' ? 'full' : 'auto';
-            if (!getSyncStatus().isSyncing) {
+            const mode = args?.['mode'] === 'full' ? 'full' : 'auto';
+            const wasSyncing = getSyncStatus().isSyncing;
+            let launched = false;
+            if (!wasSyncing) {
                 // Kick off async; intentionally not awaited so this response is fast.
                 sync(DEFAULT_CONFIG, mode).catch((e: unknown) => {
                     console.error('[MCP] sync_data background failure:', e);
                 });
+                launched = true;
             }
 
             const status = getSyncStatus();
@@ -398,10 +401,10 @@ Generate a KML file from cached query results.
                 : null;
 
             const freshness: string[] = [];
-            if (status.dataAsOf) freshness.push(`Data as-of: ${status.dataAsOf}`);
-            if (status.remoteAsOf) freshness.push(`Remote as-of: ${status.remoteAsOf}`);
-            if (status.behindByHours !== undefined) freshness.push(`Behind by: ${status.behindByHours}h`);
-            if (status.lastSyncAt) freshness.push(`Last successful sync: ${status.lastSyncAt}`);
+            if (status.dataAsOf) freshness.push(`dataAsOf: ${status.dataAsOf}`);
+            if (status.remoteAsOf) freshness.push(`remoteAsOf: ${status.remoteAsOf}`);
+            if (status.behindByHours !== undefined) freshness.push(`behindByHours: ${status.behindByHours}`);
+            if (status.lastSyncAt) freshness.push(`lastSyncAt: ${status.lastSyncAt}`);
 
             if (status.isSyncing) {
                 const lines = [
@@ -416,7 +419,9 @@ Generate a KML file from cached query results.
             const lines: string[] = [];
             if (decisionLine) lines.push(decisionLine);
             if (freshness.length) lines.push(...freshness);
-            if (lines.length === 0) lines.push('Sync triggered.');
+            if (lines.length === 0) {
+                lines.push(launched ? 'Sync triggered.' : 'Sync already in progress.');
+            }
             return { content: [{ type: 'text', text: lines.join('\n') }] };
         }
 

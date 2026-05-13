@@ -72,7 +72,22 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         const secondCall = await client.callTool({ name: 'sync_data', arguments: {} }) as any;
         const responseText = secondCall.content[0].text;
         // Either still in progress, triggered, completed, or returned freshness/decision info — all valid
-        expect(responseText).toMatch(/Sync (in progress|triggered|failed)|Last decision:|Data as-of:|Last successful sync:/i);
+        expect(responseText).toMatch(/Sync (in progress|triggered|already in progress|failed)|Last decision:|dataAsOf:|lastSyncAt:/i);
+
+        await transport.close();
+    }, 25000);
+
+    test('sync_data accepts mode="full" argument', async () => {
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+
+        const result = await client.callTool({ name: 'sync_data', arguments: { mode: 'full' } }) as any;
+        // Tool must return a content block with non-empty text; no error thrown.
+        expect(result.content).toBeDefined();
+        expect(result.content.length).toBeGreaterThan(0);
+        expect(typeof result.content[0].text).toBe('string');
+        expect(result.content[0].text.length).toBeGreaterThan(0);
 
         await transport.close();
     }, 25000);
