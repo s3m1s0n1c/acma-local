@@ -1,4 +1,4 @@
-import { extractZip, importCsv, applyIncrementalUpdate, parseRemoteTimestamp, isInputZipStale, shouldDoFullSync } from '../src/sync';
+import { extractZip, importCsv, parseRemoteTimestamp, isInputZipStale } from '../src/sync';
 import { pickSpectraRrl, fetchExtractsManifest, decideSyncAction } from '../src/sync';
 import { applyCsvDiffZip } from '../src/sync';
 import { sync, getSyncStatus } from '../src/sync';
@@ -14,41 +14,6 @@ import { jest } from '@jest/globals';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-describe('Sync Logic - Incremental Update', () => {
-    const scratchDir = path.join(__dirname, '../scratch_test_inc');
-    const dbPath = path.join(scratchDir, 'test_acma.db');
-
-    beforeEach(() => {
-        if (!fs.existsSync(scratchDir)) {
-            fs.mkdirSync(scratchDir);
-        }
-        initializeDatabase(dbPath);
-    });
-
-    afterAll(() => {
-        if (fs.existsSync(scratchDir)) {
-            fs.rmSync(scratchDir, { recursive: true, force: true });
-        }
-    });
-
-    test('should apply incremental SQL updates', async () => {
-        const updateContent = `
-      -- STATUS:SUCCESS
-      -- TO:2026-03-05 06:00:00
-      INSERT INTO client (CLIENT_NO, LICENCEE) VALUES (10, 'Inc Corp');
-      UPDATE client SET LICENCEE = 'Inc Updated' WHERE CLIENT_NO = 10;
-    `;
-
-        const timestamp = await applyIncrementalUpdate(updateContent, dbPath);
-        expect(timestamp).toBe('2026-03-05 06:00:00');
-
-        const db = new Database(dbPath);
-        const client = db.prepare('SELECT * FROM client WHERE CLIENT_NO = 10').get() as any;
-        expect(client.LICENCEE).toBe('Inc Updated');
-        db.close();
-    });
-});
 
 describe('Sync Logic - ZIP Extraction', () => {
     const scratchDir = path.join(__dirname, '../scratch_test');
@@ -217,34 +182,6 @@ describe('isInputZipStale', () => {
         const t = new Date('2026-03-05T06:00:00Z');
         fs.utimesSync(zipPath, t, t);
         expect(isInputZipStale(zipPath, t)).toBe(false);
-    });
-});
-
-describe('shouldDoFullSync', () => {
-    const remote = new Date('2026-04-28T00:00:00Z');
-
-    test('returns true when asOf is null (no DB / never synced)', () => {
-        expect(shouldDoFullSync(null, remote)).toBe(true);
-    });
-
-    test('returns false when gap is under 24h', () => {
-        const asOf = new Date('2026-04-27T05:00:00Z'); // 19h behind
-        expect(shouldDoFullSync(asOf, remote)).toBe(false);
-    });
-
-    test('returns true when gap is over 24h', () => {
-        const asOf = new Date('2026-04-26T00:00:00Z'); // 48h behind
-        expect(shouldDoFullSync(asOf, remote)).toBe(true);
-    });
-
-    test('returns false when gap is exactly 24h (boundary: <= 24h is incremental)', () => {
-        const asOf = new Date('2026-04-27T00:00:00Z'); // exactly 24h
-        expect(shouldDoFullSync(asOf, remote)).toBe(false);
-    });
-
-    test('returns false when asOf is in the future relative to remote', () => {
-        const asOf = new Date('2026-04-28T01:00:00Z');
-        expect(shouldDoFullSync(asOf, remote)).toBe(false);
     });
 });
 

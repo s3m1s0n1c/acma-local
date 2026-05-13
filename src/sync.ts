@@ -675,54 +675,6 @@ export async function importCsv(
 }
 
 /**
- * Applies incremental SQL updates to the database.
- * @param sqlContent The SQL content from the .rrl_update file.
- * @param dbPath Path to the SQLite database.
- * @returns The new "as of" timestamp.
- */
-export async function applyIncrementalUpdate(sqlContent: string, dbPath: string): Promise<string | null> {
-    const lines = sqlContent.split('\n');
-    let status = null;
-    let newAsof = null;
-    const sqlStatements: string[] = [];
-
-    for (const line of lines) {
-        const trimmedLine = line.trim();
-        if (trimmedLine.startsWith('-- STATUS:')) {
-            status = trimmedLine.replace('-- STATUS:', '').trim();
-        } else if (trimmedLine.startsWith('-- TO:')) {
-            newAsof = trimmedLine.replace('-- TO:', '').trim();
-        } else if (trimmedLine && !trimmedLine.startsWith('--')) {
-            sqlStatements.push(trimmedLine);
-        }
-    }
-
-    if (status !== 'SUCCESS') {
-        throw new Error(`Incremental update failed with status: ${status}`);
-    }
-
-    const db = new Database(dbPath);
-    db.pragma('journal_mode = WAL');
-    db.transaction(() => {
-        for (const sql of sqlStatements) {
-            try {
-                db.exec(sql);
-            } catch (e: any) {
-                // Tables not in our schema (e.g. applic_text_block, antenna_pattern) are
-                // skipped silently — the incremental feed references the full ACMA schema
-                // but we only persist a subset. Any other error is logged.
-                if (!e?.message?.includes('no such table')) {
-                    console.error(`Error executing incremental SQL: ${sql}`, e);
-                }
-            }
-        }
-    })();
-    db.close();
-
-    return newAsof;
-}
-
-/**
  * Parses ACMA's `datetime-of-extract.txt` payload (`YYYY-MM-DD HH:MM:SS`).
  * Treated as UTC so comparisons against other parsed timestamps stay consistent.
  * Returns null on any parse failure — callers fall back to existing behaviour.
@@ -768,15 +720,3 @@ export function isInputZipStale(zipPath: string, remoteTimestamp: Date): boolean
     return mtime < remoteTimestamp;
 }
 
-/** Milliseconds in the ACMA incremental update window. */
-const INCREMENTAL_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-/**
- * True iff a full sync is required — either the DB has never been synced
- * (`asOf` is null) or the gap to `remoteTimestamp` exceeds the 24-hour
- * incremental update window. Equality counts as "still incremental".
- */
-export function shouldDoFullSync(asOf: Date | null, remoteTimestamp: Date): boolean {
-    if (!asOf) return true;
-    return remoteTimestamp.getTime() - asOf.getTime() > INCREMENTAL_WINDOW_MS;
-}
