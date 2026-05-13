@@ -65,7 +65,72 @@ export async function fetchExtractsManifest(url: string): Promise<ExtractsManife
     return response.data as ExtractsManifest;
 }
 
-export type SyncMode = 'full' | 'incremental';
+// ── Sync routing: pure decision function ─────────────────────────────────────
+
+export type SyncMode = 'auto' | 'full';
+
+export type SyncAction =
+    | { kind: 'noop'; reason: 'cooldown' | 'current' }
+    | { kind: 'full'; entry: ExtractEntry; reason: 'bootstrap' | 'forced' }
+    | { kind: 'incremental'; entries: ExtractEntry[] }
+    | { kind: 'gap-exceeded'; behindHours: number };
+
+/** Minimum milliseconds between any sync attempt. */
+const SYNC_COOLDOWN_MS = 12 * 60 * 60 * 1000;   // 12 hours
+
+/**
+ * Maximum allowed gap (in ms) between meta.as_of and the oldest applicable
+ * incremental. Equal to the manifest's 24 h-per-zip window plus 6 h of slack
+ * so that we don't false-trigger on slow daily extract generation.
+ */
+const GAP_TOLERANCE_MS = 30 * 60 * 60 * 1000;   // 30 hours
+
+/**
+ * Decides what sync action to take given the local DB freshness, the remote
+ * manifest, and the user-requested mode. Pure — no I/O, no clock reads.
+ *
+ * Decision rules, in order:
+ *  1. Cooldown active → noop/cooldown.
+ *  2. asOf === null → full/bootstrap (mode is ignored; first-run must succeed).
+ *  3. mode === 'full' → full/forced.
+ *  4. asOf >= manifest.full.LastMdified → noop/current.
+ *  5. No applicable incrementals OR gap > GAP_TOLERANCE_MS → gap-exceeded.
+ *  6. Otherwise → incremental with applicable entries sorted ascending.
+ */
+export function decideSyncAction(
+    asOf: Date | null,
+    manifest: ExtractsManifest,
+    mode: SyncMode,
+    lastSync: Date | null,
+    now: Date,
+): SyncAction {
+    if (lastSync !== null && now.getTime() - lastSync.getTime() < SYNC_COOLDOWN_MS) {
+        return { kind: 'noop', reason: 'cooldown' };
+    }
+    const fullEntry = manifest.find(e => e.IsFullExtract);
+    if (!fullEntry) {
+        throw new Error('Manifest has no full extract entry');
+    }
+    if (asOf === null) {
+        return { kind: 'full', entry: fullEntry, reason: 'bootstrap' };
+    }
+    if (mode === 'full') {
+        return { kind: 'full', entry: fullEntry, reason: 'forced' };
+    }
+    const fullTime = new Date(fullEntry.LastMdified).getTime();
+    if (asOf.getTime() >= fullTime) {
+        return { kind: 'noop', reason: 'current' };
+    }
+    const applicable = manifest
+        .filter(e => !e.IsFullExtract && new Date(e.LastMdified).getTime() > asOf.getTime())
+        .sort((a, b) => new Date(a.LastMdified).getTime() - new Date(b.LastMdified).getTime());
+    if (applicable.length === 0 ||
+        new Date(applicable[0]!.LastMdified).getTime() - asOf.getTime() > GAP_TOLERANCE_MS) {
+        const behindHours = Math.round((fullTime - asOf.getTime()) / 3_600_000);
+        return { kind: 'gap-exceeded', behindHours };
+    }
+    return { kind: 'incremental', entries: applicable };
+}
 
 /**
  * The reason for the most recent sync decision. Set every time `sync()` makes
@@ -232,9 +297,6 @@ export async function performFullSync(config: SyncConfig, remoteTimestampRaw?: s
     }
 }
 
-/** Minimum milliseconds between any contact with the origin. */
-const SYNC_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
-
 /**
  * Returns the ISO-8601 timestamp of the last successful sync stored in the
  * meta table, or null if the DB doesn't exist / has never been synced.
@@ -341,7 +403,8 @@ export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
 
     // Within the incremental window — attempt incremental sync
     console.log('Checking for incremental updates...');
-    recordDecision(parsedRemote ? 'within-window' : 'parse-failed', 'incremental',
+    // TODO(Task 6): 'incremental' cast removed when SyncMode is broadened.
+    recordDecision(parsedRemote ? 'within-window' : 'parse-failed', 'incremental' as any,
         parsedRemote ? undefined : `unparseable remote timestamp '${remoteTimestampRaw}' — gap check skipped`);
     try {
         const response = await axios.get(config.incrementalUrl);
@@ -354,12 +417,12 @@ export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
             db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('last_sync', new Date().toISOString());
             db.close();
             console.log(`Incremental sync successful. Database is now as-of ${newTimestamp}`);
-            recordDecision('incremental-success', 'incremental', `as-of ${newTimestamp}`);
+            recordDecision('incremental-success', 'incremental' as any, `as-of ${newTimestamp}`);
         }
     } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error('Incremental sync failed.', e);
-        recordDecision('incremental-failed', 'incremental', msg);
+        recordDecision('incremental-failed', 'incremental' as any, msg);
         // No auto-fallback: the gap check above already routed any DB that
         // is genuinely past the incremental window. Remaining failures are
         // transient and will retry on the next scheduled sync.

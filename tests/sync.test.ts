@@ -1,6 +1,6 @@
 import { extractZip, importCsv, applyIncrementalUpdate, parseRemoteTimestamp, isInputZipStale, shouldDoFullSync } from '../src/sync';
-import { pickSpectraRrl, fetchExtractsManifest } from '../src/sync';
-import type { ExtractItem, ExtractsManifest } from '../src/sync';
+import { pickSpectraRrl, fetchExtractsManifest, decideSyncAction } from '../src/sync';
+import type { ExtractItem, ExtractsManifest, SyncAction } from '../src/sync';
 import { initializeDatabase } from '../src/db';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -272,6 +272,122 @@ describe('pickSpectraRrl', () => {
 
     test('returns null on empty list', () => {
         expect(pickSpectraRrl([])).toBeNull();
+    });
+});
+
+describe('decideSyncAction', () => {
+    // Default manifest: full=May 12, three incrementals on May 10/11/12.
+    const fixtureManifest = (): ExtractsManifest => ([
+        {
+            IsFullExtract: true,
+            LastMdified: '2026-05-12T21:51:36Z',
+            Items: [{
+                Description: 'Spectra dataset', Format: 'CSV', FileSize: 71666767,
+                FileName: 'spectra_rrl.zip',
+                FileUrl: 'https://cdn.acma.gov.au/rrl/spectra_rrl.zip',
+            }],
+        },
+        {
+            IsFullExtract: false, DateOfChanges: '2026-05-12',
+            LastMdified: '2026-05-12T13:20:59Z',
+            Items: [{
+                Description: 'Spectra dataset', Format: 'CSV', FileSize: 250000,
+                FileName: 'spectra_rrl-changes-2026-05-12.zip',
+                FileUrl: 'https://cdn.acma.gov.au/rrl/changes/spectra_rrl-changes-2026-05-12.zip',
+            }],
+        },
+        {
+            IsFullExtract: false, DateOfChanges: '2026-05-11',
+            LastMdified: '2026-05-11T13:00:00Z',
+            Items: [{
+                Description: 'Spectra dataset', Format: 'CSV', FileSize: 250000,
+                FileName: 'spectra_rrl-changes-2026-05-11.zip',
+                FileUrl: 'https://cdn.acma.gov.au/rrl/changes/spectra_rrl-changes-2026-05-11.zip',
+            }],
+        },
+        {
+            IsFullExtract: false, DateOfChanges: '2026-05-10',
+            LastMdified: '2026-05-10T13:00:00Z',
+            Items: [{
+                Description: 'Spectra dataset', Format: 'CSV', FileSize: 250000,
+                FileName: 'spectra_rrl-changes-2026-05-10.zip',
+                FileUrl: 'https://cdn.acma.gov.au/rrl/changes/spectra_rrl-changes-2026-05-10.zip',
+            }],
+        },
+    ]);
+    const now = new Date('2026-05-13T08:00:00Z');
+
+    test('cooldown active → noop/cooldown (regardless of state)', () => {
+        // lastSync only 1h ago, < 12h cooldown
+        const lastSync = new Date('2026-05-13T07:00:00Z');
+        const action = decideSyncAction(null, fixtureManifest(), 'auto', lastSync, now);
+        expect(action).toEqual({ kind: 'noop', reason: 'cooldown' });
+    });
+
+    test('bootstrap when asOf is null and no cooldown applies', () => {
+        const action = decideSyncAction(null, fixtureManifest(), 'auto', null, now);
+        expect(action.kind).toBe('full');
+        if (action.kind !== 'full') throw new Error('expected full');
+        expect(action.reason).toBe('bootstrap');
+        expect(action.entry.IsFullExtract).toBe(true);
+    });
+
+    test('mode=full → forced (even when current)', () => {
+        const asOf = new Date('2026-05-12T21:51:36Z'); // exactly current
+        const action = decideSyncAction(asOf, fixtureManifest(), 'full', null, now);
+        expect(action).toMatchObject({ kind: 'full', reason: 'forced' });
+    });
+
+    test('noop/current when asOf >= full.LastMdified', () => {
+        const asOf = new Date('2026-05-12T21:51:36Z'); // equal
+        const action = decideSyncAction(asOf, fixtureManifest(), 'auto', null, now);
+        expect(action).toEqual({ kind: 'noop', reason: 'current' });
+    });
+
+    test('noop/current when asOf is past full.LastMdified', () => {
+        const asOf = new Date('2026-05-12T22:00:00Z'); // 9m past
+        const action = decideSyncAction(asOf, fixtureManifest(), 'auto', null, now);
+        expect(action).toEqual({ kind: 'noop', reason: 'current' });
+    });
+
+    test('incremental with ascending-sorted applicable entries', () => {
+        // asOf is just before the May 11 change-zip → should include May 11 and May 12.
+        const asOf = new Date('2026-05-11T08:00:00Z');
+        const action = decideSyncAction(asOf, fixtureManifest(), 'auto', null, now);
+        expect(action.kind).toBe('incremental');
+        if (action.kind !== 'incremental') throw new Error('expected incremental');
+        expect(action.entries.map(e => e.DateOfChanges)).toEqual(['2026-05-11', '2026-05-12']);
+    });
+
+    test('gap-exceeded when asOf is older than 30 h before oldest applicable', () => {
+        // asOf is 4 days before May 12 full; oldest available is May 10. Gap > 30h.
+        const asOf = new Date('2026-05-08T00:00:00Z');
+        const action = decideSyncAction(asOf, fixtureManifest(), 'auto', null, now);
+        expect(action.kind).toBe('gap-exceeded');
+        if (action.kind !== 'gap-exceeded') throw new Error('expected gap-exceeded');
+        expect(action.behindHours).toBeGreaterThan(48);
+    });
+
+    test('gap-exceeded when no incrementals are applicable but asOf < full', () => {
+        // asOf newer than every incremental but older than the full.
+        // (Manifest only carries 3 most recent incrementals; older full re-published.)
+        const asOf = new Date('2026-05-12T20:00:00Z');
+        const noIncrementals: ExtractsManifest = [fixtureManifest()[0]!];
+        const action = decideSyncAction(asOf, noIncrementals, 'auto', null, now);
+        expect(action.kind).toBe('gap-exceeded');
+    });
+
+    test('cooldown takes precedence over forced mode', () => {
+        const lastSync = new Date('2026-05-13T07:00:00Z'); // 1h ago
+        const asOf = new Date('2026-05-11T00:00:00Z');
+        const action = decideSyncAction(asOf, fixtureManifest(), 'full', lastSync, now);
+        expect(action).toEqual({ kind: 'noop', reason: 'cooldown' });
+    });
+
+    test('throws if manifest has no full extract entry', () => {
+        const onlyIncrementals: ExtractsManifest = fixtureManifest().slice(1);
+        expect(() => decideSyncAction(null, onlyIncrementals, 'auto', null, now))
+            .toThrow('Manifest has no full extract entry');
     });
 });
 
