@@ -137,16 +137,19 @@ export function decideSyncAction(
 // ── CSV-diff incremental application ─────────────────────────────────────────
 
 /**
- * Single-column primary keys for the tables we materialise. ACMA's full extract
- * does not declare PKs and the schema does not enforce them; we use these to
- * key the DELETE step of incremental application.
+ * Primary keys for the tables we materialise. ACMA's full extract does not
+ * declare PKs and the schema does not enforce them; we use these to key the
+ * DELETE step of incremental application. Values may be a single column name
+ * (string) or an ordered array of column names for composite PKs.
  */
-const PK_BY_TABLE: Record<string, string> = {
+const PK_BY_TABLE: Record<string, string | string[]> = {
     client: 'CLIENT_NO',
     licence: 'LICENCE_NO',
     site: 'SITE_ID',
     device_details: 'SDD_ID',
     antenna: 'ANTENNA_ID',
+    // Composite-PK seed for tests; real entries land in Task 2.
+    licence_subservice: ['SS_ID', 'SV_SV_ID'],
 };
 
 /**
@@ -206,26 +209,28 @@ function applyCsvDiff(csvBuffer: Buffer, tableName: string, db: Database.Databas
     if (invalidCol) {
         throw new Error(`Unexpected column name '${invalidCol}' in ${tableName} change-zip`);
     }
-    const pk = PK_BY_TABLE[tableName]!;
+    const pkSpec = PK_BY_TABLE[tableName]!;
+    const pkCols: string[] = Array.isArray(pkSpec) ? pkSpec : [pkSpec];
     const dataCols = columns.filter(c => c !== 'CHANGE');
     const placeholders = dataCols.map(() => '?').join(',');
     const insertStmt = db.prepare(
         `INSERT INTO ${tableName} (${dataCols.join(',')}) VALUES (${placeholders})`
     );
-    const deleteStmt = db.prepare(`DELETE FROM ${tableName} WHERE ${pk} = ?`);
+    const deleteWhere = pkCols.map(c => `${c} = ?`).join(' AND ');
+    const deleteStmt = db.prepare(`DELETE FROM ${tableName} WHERE ${deleteWhere}`);
 
     const apply = db.transaction(() => {
         for (const row of rows) {
             const change = row.CHANGE;
-            const pkValue = row[pk];
+            const pkValues = pkCols.map(c => row[c]);
             if (change === 'Deleted') {
-                deleteStmt.run(pkValue);
+                deleteStmt.run(...pkValues);
             } else if (change === 'Added' || change === 'Updated') {
-                deleteStmt.run(pkValue);
+                deleteStmt.run(...pkValues);
                 const values = dataCols.map(c => row[c] === '' ? null : row[c]);
                 insertStmt.run(...values);
             } else {
-                console.error(`Unknown CHANGE='${change}' in ${tableName}; skipping row pk=${pkValue}`);
+                console.error(`Unknown CHANGE='${change}' in ${tableName}; skipping row pk=${JSON.stringify(pkValues)}`);
             }
         }
     });

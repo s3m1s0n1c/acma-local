@@ -529,6 +529,36 @@ describe('applyCsvDiffZip', () => {
         await expect(applyCsvDiffZip(zipPath, dbPath))
             .rejects.toThrow(/Unexpected column name/);
     });
+
+    test('composite-PK table: DELETE binds all PK columns positionally', async () => {
+        // Add a synthetic composite-PK entry to PK_BY_TABLE via a real table.
+        // licence_subservice is the smallest real composite-PK table; its schema
+        // arrives in Task 2 of this plan but for THIS test we create it inline so
+        // Task 1 is independently testable.
+        const seedDb = new Database(dbPath);
+        seedDb.exec(`
+            CREATE TABLE IF NOT EXISTS licence_subservice(
+                SS_ID INTEGER, SV_SV_ID INTEGER, SS_NAME TEXT
+            );
+            INSERT INTO licence_subservice VALUES (101, 1, 'HF Domestic');
+            INSERT INTO licence_subservice VALUES (101, 2, 'HF Domestic clone');
+        `);
+        seedDb.close();
+
+        // Change-zip: delete (SS_ID=101, SV_SV_ID=1) — the other row must survive.
+        buildChangeZip({
+            'licence_subservice.csv':
+                'SS_ID,SV_SV_ID,SS_NAME,CHANGE\n' +
+                '101,1,,Deleted\n',
+        });
+
+        await applyCsvDiffZip(zipPath, dbPath);
+
+        const db = new Database(dbPath);
+        const rows = db.prepare('SELECT * FROM licence_subservice ORDER BY SV_SV_ID').all() as any[];
+        db.close();
+        expect(rows).toEqual([{ SS_ID: 101, SV_SV_ID: 2, SS_NAME: 'HF Domestic clone' }]);
+    });
 });
 
 describe('sync() orchestrator (mocked axios)', () => {
