@@ -196,4 +196,25 @@ describe('Logic Layer', () => {
         expect(outside).toHaveLength(0);
         expect(straddle).toHaveLength(1);
     });
+
+    test('searchSpectrumBand handles rows with NULL UP_FREQUENCY_END', () => {
+        const db = new Database(dbPath);
+        db.exec(`
+            INSERT INTO auth_spectrum_freq
+                (LICENCE_NO, AREA_CODE, AREA_NAME, LW_FREQUENCY_START, LW_FREQUENCY_END,
+                 UP_FREQUENCY_START, UP_FREQUENCY_END)
+                VALUES ('LW_ONLY', 'A1', 'AreaX', 3000000, 4000000, NULL, NULL);
+        `);
+        db.close();
+
+        const db2 = new Database(dbPath, { readonly: true });
+        // Query overlaps the LW range only.
+        const lwHit = searchSpectrumBand(db2, 3500000, 3600000, 50) as any[];
+        // Query is in the (no-)UP range — should NOT match the LW_ONLY row.
+        const upMiss = searchSpectrumBand(db2, 5000000, 6000000, 50) as any[];
+        db2.close();
+
+        expect(lwHit.map(r => r.LICENCE_NO)).toContain('LW_ONLY');
+        expect(upMiss.map(r => r.LICENCE_NO)).not.toContain('LW_ONLY');
+    });
 });

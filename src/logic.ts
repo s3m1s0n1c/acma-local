@@ -106,8 +106,9 @@ export function searchSpectrumBand(
   freqMaxHz: number,
   limit: number = 20
 ) {
-  // A band overlaps the query iff NOT (band entirely below query OR band entirely above).
-  // The "band" here is the union of LW (lower) and UP (upper) ranges.
+  // Two sub-bands per row: LW (lower) and UP (upper). Either may be NULL.
+  // A row matches if EITHER sub-band overlaps the query [min, max].
+  // Standard interval-overlap form: range_end >= min AND range_start <= max.
   return db.prepare(`
     SELECT f.LICENCE_NO, f.AREA_CODE, f.AREA_NAME,
            f.LW_FREQUENCY_START, f.LW_FREQUENCY_END,
@@ -118,9 +119,10 @@ export function searchSpectrumBand(
     LEFT JOIN auth_spectrum_area a
            ON a.LICENCE_NO = f.LICENCE_NO AND a.AREA_CODE = f.AREA_CODE
     LEFT JOIN licence l ON l.LICENCE_NO = f.LICENCE_NO
-    WHERE NOT (f.UP_FREQUENCY_END < ? OR f.LW_FREQUENCY_START > ?)
+    WHERE (f.LW_FREQUENCY_END   >= ? AND f.LW_FREQUENCY_START <= ?)
+       OR (f.UP_FREQUENCY_END   >= ? AND f.UP_FREQUENCY_START <= ?)
     LIMIT ?
-  `).all(freqMinHz, freqMaxHz, limit);
+  `).all(freqMinHz, freqMaxHz, freqMinHz, freqMaxHz, limit);
 }
 
 export function getLicenceDetails(db: Database.Database, licenceNo: string) {
