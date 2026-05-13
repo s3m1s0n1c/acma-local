@@ -557,6 +557,44 @@ describe('applyCsvDiffZip', () => {
         expect(rows).toEqual([{ LW_FREQUENCY_START: 500 }]);
     });
 
+    test('applic_text_block incremental updates FTS5 mirror', async () => {
+        const seedDb = new Database(dbPath);
+        seedDb.exec(`
+            INSERT INTO applic_text_block (APTB_ID, APTB_TEXT, APTB_DESCRIPTION)
+                VALUES (10, 'Initial conditions for the licence.', 'Initial');
+            INSERT INTO applic_text_block_fts(applic_text_block_fts) VALUES('rebuild');
+        `);
+        seedDb.close();
+
+        // Change-zip: Update row 10's APTB_TEXT, Add row 20, Delete row 10's twin (none — should be no-op).
+        buildChangeZip({
+            'applic_text_block.csv':
+                'APTB_ID,APTB_TABLE_PREFIX,APTB_TABLE_ID,LICENCE_NO,APTB_DESCRIPTION,APTB_CATEGORY,APTB_TEXT,APTB_ITEM,CHANGE\n' +
+                '10,,,,Updated description,,Revised conditions about emission masks.,,Updated\n' +
+                '20,,,,New description,,Newly added emission text.,,Added\n',
+        });
+        await applyCsvDiffZip(zipPath, dbPath);
+
+        const db = new Database(dbPath, { readonly: true });
+        // The old text "Initial conditions" should no longer match.
+        const oldHits = db.prepare(`
+            SELECT rowid FROM applic_text_block_fts WHERE applic_text_block_fts MATCH 'initial'
+        `).all();
+        // The new text "Revised conditions" should match for row 10.
+        const newHits = db.prepare(`
+            SELECT rowid FROM applic_text_block_fts WHERE applic_text_block_fts MATCH 'revised'
+        `).all() as any[];
+        // The added row 20 should match for "newly".
+        const addedHits = db.prepare(`
+            SELECT rowid FROM applic_text_block_fts WHERE applic_text_block_fts MATCH 'newly'
+        `).all() as any[];
+        db.close();
+
+        expect(oldHits).toHaveLength(0);
+        expect(newHits.map(h => h.rowid)).toEqual([10]);
+        expect(addedHits.map(h => h.rowid)).toEqual([20]);
+    });
+
     test('composite-PK table: DELETE binds all PK columns positionally', async () => {
         // Add a synthetic composite-PK entry to PK_BY_TABLE via a real table.
         // licence_subservice is the smallest real composite-PK table; its schema

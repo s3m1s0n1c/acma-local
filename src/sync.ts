@@ -239,16 +239,51 @@ function applyCsvDiff(csvBuffer: Buffer, tableName: string, db: Database.Databas
     const deleteWhere = pkCols.map(c => `${c} = ?`).join(' AND ');
     const deleteStmt = db.prepare(`DELETE FROM ${tableName} WHERE ${deleteWhere}`);
 
+    const isApplicTextBlock = tableName === 'applic_text_block';
+
+    const selectOldStmt = isApplicTextBlock
+        ? db.prepare(`SELECT APTB_TEXT, APTB_DESCRIPTION FROM applic_text_block WHERE APTB_ID = ?`)
+        : null;
+    const ftsDeleteStmt = isApplicTextBlock
+        ? db.prepare(
+            `INSERT INTO applic_text_block_fts(applic_text_block_fts, rowid, APTB_TEXT, APTB_DESCRIPTION)
+             VALUES('delete', ?, ?, ?)`
+        )
+        : null;
+    const ftsInsertStmt = isApplicTextBlock
+        ? db.prepare(
+            `INSERT INTO applic_text_block_fts(rowid, APTB_TEXT, APTB_DESCRIPTION) VALUES (?, ?, ?)`
+        )
+        : null;
+
     const apply = db.transaction(() => {
         for (const row of rows) {
             const change = row.CHANGE;
             const pkValues = pkCols.map(c => row[c]);
+
+            // FTS5 delete must happen BEFORE the base DELETE — it needs the old values.
+            if (isApplicTextBlock && (change === 'Deleted' || change === 'Updated')) {
+                const aptbId = Number(row.APTB_ID);
+                const old = selectOldStmt!.get(aptbId) as { APTB_TEXT?: string; APTB_DESCRIPTION?: string } | undefined;
+                if (old) {
+                    ftsDeleteStmt!.run(aptbId, old.APTB_TEXT ?? '', old.APTB_DESCRIPTION ?? '');
+                }
+            }
+
             if (change === 'Deleted') {
                 deleteStmt.run(...pkValues);
             } else if (change === 'Added' || change === 'Updated') {
                 deleteStmt.run(...pkValues);
                 const values = dataCols.map(c => row[c] === '' ? null : row[c]);
                 insertStmt.run(...values);
+                if (isApplicTextBlock) {
+                    const aptbId = Number(row.APTB_ID);
+                    ftsInsertStmt!.run(
+                        aptbId,
+                        row.APTB_TEXT ?? '',
+                        row.APTB_DESCRIPTION ?? '',
+                    );
+                }
             } else {
                 console.error(`Unknown CHANGE='${change}' in ${tableName}; skipping row pk=${JSON.stringify(pkValues)}`);
             }
