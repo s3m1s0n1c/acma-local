@@ -9,17 +9,13 @@ import { pipeline } from 'stream/promises';
 import { initializeDatabase, TABLE_METADATA } from './db.js';
 
 export interface SyncConfig {
-    datasetUrl: string;
-    timestampUrl: string;
-    incrementalUrl: string;
+    extractsUrl: string;
     dataDir: string;
     dbPath: string;
 }
 
 export const DEFAULT_CONFIG: SyncConfig = {
-    datasetUrl: 'https://web.acma.gov.au/rrl-updates/spectra_rrl.zip',
-    timestampUrl: 'https://web.acma.gov.au/rrl-updates/datetime-of-extract.txt',
-    incrementalUrl: 'https://web.acma.gov.au/rrl/spectra_incremental.rrl_update',
+    extractsUrl: 'https://backend.acma.gov.au/rrl/v1/Extracts',
     dataDir: './data',
     dbPath: './data/acma.db',
 };
@@ -233,19 +229,20 @@ function applyCsvDiff(csvBuffer: Buffer, tableName: string, db: Database.Databas
     apply();
 }
 
+// SyncMode is defined in Task 3 alongside SyncAction.
+
 /**
- * The reason for the most recent sync decision. Set every time `sync()` makes
- * a routing choice, so callers can tell why a run was skipped or which mode it
- * picked. Outcome reasons (`incremental-failed`, `incremental-success`,
- * `full-success`, `full-failed`) are set at the end of an attempt.
+ * The reason for the most recent sync decision. Outcome reasons are set at
+ * the end of an attempt; decision reasons (`cooldown`, `current`,
+ * `gap-exceeded`, etc.) are set when sync() routes a request.
  */
 export type SyncReason =
-    | 'cooldown-skipped'
-    | 'fetch-failed'
-    | 'parse-failed'
+    | 'cooldown'
+    | 'current'
+    | 'manifest-fetch-failed'
     | 'no-db'
     | 'gap-exceeded'
-    | 'within-window'
+    | 'forced'
     | 'incremental-success'
     | 'incremental-failed'
     | 'full-success'
@@ -256,14 +253,22 @@ export interface SyncStatus {
     progress: number; // 0-100
     currentTable?: string;
     lastError?: string;
-    /** Mode of the most recent attempt. Absent if no sync has been attempted. */
-    mode?: SyncMode;
+    /** Executed mode, or 'auto' when no execution occurred (noop / gap-exceeded). */
+    mode?: SyncMode | 'incremental';
     /** Reason / outcome of the most recent decision. */
     reason?: SyncReason;
     /** ISO-8601 timestamp of the most recent decision. */
     lastDecisionAt?: string;
-    /** Free-form context for the decision (e.g. "DB 53h behind", "next sync in 47 min"). */
+    /** Free-form context for the decision (e.g. "3 change-zips applied"). */
     detail?: string;
+    /** "How fresh is the data?" — mirror of meta.as_of in ISO 8601. */
+    dataAsOf?: string;
+    /** "When did our pipeline last successfully run?" — mirror of meta.last_sync. */
+    lastSyncAt?: string;
+    /** "What is upstream's latest data?" — last seen manifest full.LastMdified. */
+    remoteAsOf?: string;
+    /** Derived: (remoteAsOf - dataAsOf) rounded to hours; 0 when current. */
+    behindByHours?: number;
 }
 
 let currentSyncStatus: SyncStatus = {
@@ -275,11 +280,11 @@ export function getSyncStatus(): SyncStatus {
     return { ...currentSyncStatus };
 }
 
-/**
- * Records the latest sync decision. Mode is omitted when no sync was attempted
- * (cooldown / fetch-failed). `lastDecisionAt` is set to now.
- */
-function recordDecision(reason: SyncReason, mode: SyncMode | undefined, detail?: string): void {
+function recordDecision(
+    reason: SyncReason,
+    mode: SyncStatus['mode'] | undefined,
+    detail?: string
+): void {
     currentSyncStatus = {
         ...currentSyncStatus,
         reason,
@@ -306,96 +311,10 @@ async function downloadFile(url: string, targetPath: string): Promise<void> {
  * Performs a full synchronization: download, extract, and import all data.
  */
 export async function performFullSync(config: SyncConfig, remoteTimestampRaw?: string): Promise<void> {
-    if (currentSyncStatus.isSyncing) {
-        throw new Error('Synchronization already in progress');
-    }
-
-    // Reset transient run state but preserve decision metadata set by sync().
-    const { currentTable: _ct, lastError: _le, ...preserved } = currentSyncStatus;
-    void _ct; void _le;
-    currentSyncStatus = { ...preserved, isSyncing: true, progress: 0 };
-
-    try {
-        if (!fs.existsSync(config.dataDir)) {
-            fs.mkdirSync(config.dataDir, { recursive: true });
-        }
-
-        let remoteTimestamp: string;
-        if (remoteTimestampRaw !== undefined) {
-            remoteTimestamp = remoteTimestampRaw;
-        } else {
-            console.log('Fetching dataset timestamp...');
-            const tsResponse = await axios.get(config.timestampUrl, { responseType: 'text' });
-            remoteTimestamp = String(tsResponse.data).trim();
-        }
-
-        const zipPathFromInput = '/projects/acma-local-redux/inputs/spectra_rrl.zip';
-        const zipPath = path.join(config.dataDir, 'spectra_rrl.zip');
-
-        currentSyncStatus.progress = 5;
-
-        const parsedRemote = parseRemoteTimestamp(remoteTimestamp);
-        const inputZipExists = fs.existsSync(zipPathFromInput);
-        const inputZipStale = parsedRemote !== null && isInputZipStale(zipPathFromInput, parsedRemote);
-
-        if (inputZipExists && !inputZipStale) {
-            console.log('Using local dataset from inputs/');
-            fs.copyFileSync(zipPathFromInput, zipPath);
-        } else {
-            if (inputZipStale && parsedRemote) {
-                const mtime = fs.statSync(zipPathFromInput).mtime.toISOString();
-                console.log(`[SYNC] Input zip mtime=${mtime} is older than remote=${parsedRemote.toISOString()}; ignoring stale input.`);
-            }
-            console.log('Downloading full dataset...');
-            await downloadFile(config.datasetUrl, zipPath);
-        }
-
-        currentSyncStatus.progress = 20;
-
-        console.log('Extracting ZIP...');
-        const extractDir = path.join(config.dataDir, 'extracted');
-        if (!fs.existsSync(extractDir)) fs.mkdirSync(extractDir, { recursive: true });
-        const files = await extractZip(zipPath, extractDir);
-
-        currentSyncStatus.progress = 30;
-
-        console.log('Initializing database...');
-        initializeDatabase(config.dbPath);
-
-        const tablesToImport = files.filter(file => {
-            const fileName = path.basename(file);
-            const targetTable = fileName.split('.')[0]!;
-            return Object.keys(TABLE_METADATA).includes(targetTable);
-        });
-
-        for (let i = 0; i < tablesToImport.length; i++) {
-            const file = tablesToImport[i]!;
-            const fileName = path.basename(file);
-            const targetTable = fileName.split('.')[0]!;
-
-            currentSyncStatus.currentTable = targetTable;
-            // Map 30-95% across table imports
-            const tableProgressBase = 30 + (i / tablesToImport.length) * 65;
-
-            console.log(`Importing ${fileName}...`);
-            await importCsv(file, config.dbPath, targetTable, (p) => {
-                currentSyncStatus.progress = Math.round(tableProgressBase + (p / tablesToImport.length) * (65 / 100));
-            });
-        }
-
-        const db = new Database(config.dbPath);
-        db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('as_of', remoteTimestamp);
-        db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('last_sync', new Date().toISOString());
-        db.close();
-
-        currentSyncStatus.progress = 100;
-        console.log('Full sync complete.');
-    } catch (error: any) {
-        currentSyncStatus.lastError = error.message;
-        throw error;
-    } finally {
-        currentSyncStatus.isSyncing = false;
-    }
+    // Body intentionally removed in Task 6 of the migration plan. Task 7
+    // rewrites this around the /v1/Extracts manifest entry.
+    void config; void remoteTimestampRaw;
+    throw new Error('performFullSync body is being rewritten in Task 7; do not invoke between Task 6 and Task 7.');
 }
 
 /**
@@ -422,112 +341,10 @@ function getLastSyncTime(dbPath: string): Date | null {
  * Will not contact the origin if the last successful sync was within 12 hours.
  */
 export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
-    // ── Rate-limit guard ──────────────────────────────────────────────────────
-    const lastSync = getLastSyncTime(config.dbPath);
-    if (lastSync) {
-        const msSinceLast = Date.now() - lastSync.getTime();
-        if (msSinceLast < SYNC_COOLDOWN_MS) {
-            const nextSyncIn = Math.ceil((SYNC_COOLDOWN_MS - msSinceLast) / 60_000);
-            console.log(
-                `[SYNC] Skipping — last sync was ${Math.floor(msSinceLast / 60_000)} min ago. ` +
-                `Next allowed sync in ~${nextSyncIn} min.`
-            );
-            recordDecision('cooldown-skipped', undefined, `next sync allowed in ~${nextSyncIn} min`);
-            return;
-        }
-    }
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // Fetch remote timestamp once; reused below to decide full vs incremental
-    // and threaded through performFullSync to avoid a second fetch.
-    let remoteTimestampRaw: string;
-    try {
-        const tsResponse = await axios.get(config.timestampUrl, { responseType: 'text' });
-        remoteTimestampRaw = String(tsResponse.data).trim();
-    } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error('[SYNC] Could not fetch remote timestamp; aborting sync.', e);
-        recordDecision('fetch-failed', undefined, msg);
-        return;
-    }
-    const parsedRemote = parseRemoteTimestamp(remoteTimestampRaw);
-    if (!parsedRemote) {
-        console.log(`[SYNC] Could not parse remote timestamp '${remoteTimestampRaw}'; proceeding without staleness check.`);
-    }
-
-    const dbExists = fs.existsSync(config.dbPath);
-
-    if (!dbExists) {
-        recordDecision('no-db', 'full', 'no local database; performing initial full sync');
-        try {
-            await performFullSync(config, remoteTimestampRaw);
-            recordDecision('full-success', 'full');
-        } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            recordDecision('full-failed', 'full', msg);
-            throw e;
-        }
-        return;
-    }
-
-    // Read meta.as_of for gap check
-    let asOf: Date | null = null;
-    if (parsedRemote) {
-        const db = new Database(config.dbPath, { readonly: true, fileMustExist: true });
-        try {
-            const row = db.prepare("SELECT value FROM meta WHERE key = 'as_of'").get() as { value: string } | undefined;
-            // meta.as_of is written by performFullSync (raw remote timestamp) and
-            // applyIncrementalUpdate (-- TO: line); both produce YYYY-MM-DD HH:MM:SS today.
-            asOf = row ? parseRemoteTimestamp(row.value) : null;
-        } finally {
-            if (db.open) db.close();
-        }
-
-        if (shouldDoFullSync(asOf, parsedRemote)) {
-            const gapHours = asOf
-                ? Math.round((parsedRemote.getTime() - asOf.getTime()) / 3_600_000)
-                : null;
-            const gapDesc = gapHours === null ? 'no prior sync' : `${gapHours}h behind`;
-            console.log(`[SYNC] DB is ${gapDesc} (remote=${parsedRemote.toISOString()}); full sync required.`);
-            recordDecision('gap-exceeded', 'full', `DB ${gapDesc} of remote ${parsedRemote.toISOString()}`);
-            try {
-                await performFullSync(config, remoteTimestampRaw);
-                recordDecision('full-success', 'full');
-            } catch (e) {
-                const msg = e instanceof Error ? e.message : String(e);
-                recordDecision('full-failed', 'full', msg);
-                throw e;
-            }
-            return;
-        }
-    }
-
-    // Within the incremental window — attempt incremental sync
-    console.log('Checking for incremental updates...');
-    // TODO(Task 6): pass mode='incremental' once SyncMode includes it.
-    recordDecision(parsedRemote ? 'within-window' : 'parse-failed', undefined,
-        parsedRemote ? undefined : `unparseable remote timestamp '${remoteTimestampRaw}' — gap check skipped`);
-    try {
-        const response = await axios.get(config.incrementalUrl);
-        const updateContent = response.data;
-
-        const newTimestamp = await applyIncrementalUpdate(updateContent, config.dbPath);
-        if (newTimestamp) {
-            const db = new Database(config.dbPath);
-            db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('as_of', newTimestamp);
-            db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('last_sync', new Date().toISOString());
-            db.close();
-            console.log(`Incremental sync successful. Database is now as-of ${newTimestamp}`);
-            recordDecision('incremental-success', undefined, `as-of ${newTimestamp}`); // TODO(Task 6): pass mode='incremental'.
-        }
-    } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error('Incremental sync failed.', e);
-        recordDecision('incremental-failed', undefined, msg); // TODO(Task 6): pass mode='incremental'.
-        // No auto-fallback: the gap check above already routed any DB that
-        // is genuinely past the incremental window. Remaining failures are
-        // transient and will retry on the next scheduled sync.
-    }
+    // Body intentionally removed in Task 6 of the migration plan. Task 8
+    // rewrites this around decideSyncAction + the /v1/Extracts manifest.
+    void config;
+    throw new Error('sync() body is being rewritten in Task 8; do not invoke between Task 6 and Task 8.');
 }
 
 // Run if called directly
