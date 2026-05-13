@@ -59,6 +59,9 @@ export function pickSpectraRrl(items: ExtractItem[]): ExtractItem | null {
  */
 export async function fetchExtractsManifest(url: string): Promise<ExtractsManifest> {
     const response = await axios.get(url);
+    if (!Array.isArray(response.data)) {
+        throw new Error(`fetchExtractsManifest: unexpected response shape (expected array, got ${typeof response.data})`);
+    }
     return response.data as ExtractsManifest;
 }
 
@@ -283,8 +286,13 @@ function recordDecision(
     mode: SyncStatus['mode'] | undefined,
     detail?: string
 ): void {
+    // Rebuild the status object so that `mode` and `detail` are cleared when
+    // the caller passes undefined — spread-merging would otherwise leave stale
+    // values from a previous call (e.g. mode='full' leaking into gap-exceeded).
+    const { mode: _m, detail: _d, ...rest } = currentSyncStatus;
+    void _m; void _d;
     currentSyncStatus = {
-        ...currentSyncStatus,
+        ...rest,
         reason,
         lastDecisionAt: new Date().toISOString(),
         ...(mode !== undefined ? { mode } : {}),
@@ -296,12 +304,7 @@ function recordDecision(
  * Downloads a file from a URL to a target path.
  */
 async function downloadFile(url: string, targetPath: string): Promise<void> {
-    const response = await axios({
-        method: 'get',
-        url: url,
-        responseType: 'stream',
-    });
-
+    const response = await axios.get(url, { responseType: 'stream' });
     await pipeline(response.data, fs.createWriteStream(targetPath));
 }
 
@@ -405,11 +408,24 @@ export async function performFullSync(config: SyncConfig, fullEntry: ExtractEntr
     }
 }
 
-/**
- * Returns the ISO-8601 timestamp of the last successful sync stored in the
- * meta table, or null if the DB doesn't exist / has never been synced.
- */
-function getLastSyncTime(dbPath: string): Date | null {
+// ── DB freshness helpers ─────────────────────────────────────────────────────
+
+function getDbAsOf(dbPath: string): Date | null {
+    if (!fs.existsSync(dbPath)) return null;
+    try {
+        const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+        try {
+            const row = db.prepare("SELECT value FROM meta WHERE key = 'as_of'").get() as { value: string } | undefined;
+            return row ? parseRemoteTimestamp(row.value) : null;
+        } finally {
+            if (db.open) db.close();
+        }
+    } catch {
+        return null;
+    }
+}
+
+function getDbLastSync(dbPath: string): Date | null {
     if (!fs.existsSync(dbPath)) return null;
     try {
         const db = new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -425,14 +441,144 @@ function getLastSyncTime(dbPath: string): Date | null {
 }
 
 /**
- * Orchestrates the sync process.
- * Will not contact the origin if the last successful sync was within 12 hours.
+ * Returns the ISO-8601 timestamp of the last successful sync stored in the
+ * meta table, or null if the DB doesn't exist / has never been synced.
+ * Thin wrapper over getDbLastSync for backwards compatibility.
  */
-export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
-    // Body intentionally removed in Task 6 of the migration plan. Task 8
-    // rewrites this around decideSyncAction + the /v1/Extracts manifest.
-    void config;
-    throw new Error('sync() body is being rewritten in Task 8; do not invoke between Task 6 and Task 8.');
+function getLastSyncTime(dbPath: string): Date | null {
+    return getDbLastSync(dbPath);
+}
+
+function updateFreshnessStatus(
+    asOf: Date | null,
+    fullEntry: ExtractEntry,
+    lastSync: Date | null,
+): void {
+    const remoteAsOf = fullEntry.LastMdified;
+    const dataAsOf = asOf?.toISOString();
+    const behindByHours = asOf
+        ? Math.max(0, Math.round((new Date(remoteAsOf).getTime() - asOf.getTime()) / 3_600_000))
+        : undefined;
+    currentSyncStatus = {
+        ...currentSyncStatus,
+        ...(dataAsOf !== undefined ? { dataAsOf } : {}),
+        remoteAsOf,
+        ...(behindByHours !== undefined ? { behindByHours } : {}),
+        ...(lastSync !== null ? { lastSyncAt: lastSync.toISOString() } : {}),
+    };
+}
+
+function refreshFreshnessAfter(dbPath: string, newAsOf: string, fullEntry: ExtractEntry): void {
+    const asOfDate = parseRemoteTimestamp(newAsOf);
+    updateFreshnessStatus(asOfDate, fullEntry, getDbLastSync(dbPath));
+}
+
+/**
+ * Orchestrates the sync process using the ACMA /v1/Extracts manifest as the
+ * source of truth. Never auto-pulls the full 70 MB extract on `mode='auto'` —
+ * caller must pass `mode='full'` (typically via the MCP sync_data tool) to
+ * force a full re-download when the DB is too far behind the manifest window.
+ */
+export async function sync(
+    config: SyncConfig = DEFAULT_CONFIG,
+    mode: SyncMode = 'auto',
+): Promise<void> {
+    const lastSync = getLastSyncTime(config.dbPath);
+
+    let manifest: ExtractsManifest;
+    try {
+        manifest = await fetchExtractsManifest(config.extractsUrl);
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('[SYNC] Could not fetch /v1/Extracts manifest; aborting sync.', e);
+        recordDecision('manifest-fetch-failed', undefined, msg);
+        return;
+    }
+
+    const fullEntry = manifest.find(e => e.IsFullExtract);
+    if (!fullEntry) {
+        console.error('[SYNC] Manifest has no full extract entry; aborting.');
+        recordDecision('manifest-fetch-failed', undefined, 'no full entry in manifest');
+        return;
+    }
+
+    const asOf = getDbAsOf(config.dbPath);
+    updateFreshnessStatus(asOf, fullEntry, getDbLastSync(config.dbPath));
+
+    const action = decideSyncAction(asOf, manifest, mode, lastSync, new Date());
+
+    switch (action.kind) {
+        case 'noop':
+            recordDecision(action.reason, undefined);
+            return;
+
+        case 'gap-exceeded': {
+            const detail = `${action.behindHours}h behind manifest window — run sync_data mode=full to recover`;
+            console.error(`[SYNC] ${detail}`);
+            recordDecision('gap-exceeded', undefined, detail);
+            return;
+        }
+
+        case 'full': {
+            try {
+                await performFullSync(config, action.entry);
+                refreshFreshnessAfter(config.dbPath, action.entry.LastMdified, fullEntry);
+                recordDecision(
+                    action.reason === 'bootstrap' ? 'no-db' : 'forced',
+                    'full',
+                    `as-of ${action.entry.LastMdified}`,
+                );
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                recordDecision('full-failed', 'full', msg);
+                throw e;
+            }
+            return;
+        }
+
+        case 'incremental': {
+            try {
+                if (!fs.existsSync(config.dataDir)) {
+                    fs.mkdirSync(config.dataDir, { recursive: true });
+                }
+                const changesDir = path.join(config.dataDir, 'changes');
+                if (!fs.existsSync(changesDir)) fs.mkdirSync(changesDir, { recursive: true });
+
+                for (const entry of action.entries) {
+                    const item = pickSpectraRrl(entry.Items);
+                    if (!item) {
+                        throw new Error(`Incremental entry for ${entry.DateOfChanges} has no spectra_rrl item`);
+                    }
+                    const zipPath = path.join(changesDir, item.FileName);
+                    console.error(`Downloading ${item.FileUrl}...`);
+                    await downloadFile(item.FileUrl, zipPath);
+                    console.error(`Applying ${item.FileName}...`);
+                    await applyCsvDiffZip(zipPath, config.dbPath);
+                }
+
+                const newAsOf = action.entries.at(-1)!.LastMdified;
+                const db = new Database(config.dbPath);
+                try {
+                    db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('as_of', newAsOf);
+                    db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('last_sync', new Date().toISOString());
+                } finally {
+                    db.close();
+                }
+
+                refreshFreshnessAfter(config.dbPath, newAsOf, fullEntry);
+                recordDecision(
+                    'incremental-success',
+                    'incremental',
+                    `${action.entries.length} change-zip(s) applied; as-of ${newAsOf}`,
+                );
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                console.error('[SYNC] Incremental sync failed.', e);
+                recordDecision('incremental-failed', 'incremental', msg);
+            }
+            return;
+        }
+    }
 }
 
 // Run if called directly

@@ -1,6 +1,7 @@
 import { extractZip, importCsv, applyIncrementalUpdate, parseRemoteTimestamp, isInputZipStale, shouldDoFullSync } from '../src/sync';
 import { pickSpectraRrl, fetchExtractsManifest, decideSyncAction } from '../src/sync';
 import { applyCsvDiffZip } from '../src/sync';
+import { sync, getSyncStatus } from '../src/sync';
 import type { ExtractItem, ExtractsManifest, SyncAction } from '../src/sync';
 import { initializeDatabase } from '../src/db';
 import Database from 'better-sqlite3';
@@ -438,6 +439,12 @@ describe('fetchExtractsManifest', () => {
         await expect(fetchExtractsManifest('https://example/v1/Extracts'))
             .rejects.toThrow('network down');
     });
+
+    test('throws on non-array response payload', async () => {
+        axiosGetSpy.mockResolvedValueOnce({ data: { error: 'oops' } } as any);
+        await expect(fetchExtractsManifest('https://example/v1/Extracts'))
+            .rejects.toThrow('unexpected response shape');
+    });
 });
 
 describe('applyCsvDiffZip', () => {
@@ -564,5 +571,125 @@ describe('applyCsvDiffZip', () => {
         const row = db.prepare('SELECT CLIENT_NO, LICENCEE FROM client WHERE CLIENT_NO = 99').get() as any;
         db.close();
         expect(row).toEqual({ CLIENT_NO: 99, LICENCEE: 'Late Arrival' });
+    });
+});
+
+describe('sync() orchestrator (mocked axios)', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_orchestrator');
+    const dbPath = path.join(scratchDir, 'test_acma.db');
+    const dataDir = scratchDir;
+    const cfg = { extractsUrl: 'https://example/v1/Extracts', dataDir, dbPath };
+
+    let axiosGetSpy: ReturnType<typeof jest.spyOn>;
+
+    // Track whether we moved the real inputs zip so we can restore it.
+    const realInputsZip = path.resolve('inputs/spectra_rrl.zip');
+    const realInputsZipBackup = path.resolve('inputs/spectra_rrl.zip.bak');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        axiosGetSpy = jest.spyOn(axios, 'get');
+    });
+
+    afterEach(() => {
+        jest.restoreAllMocks();
+        // Restore inputs zip if we moved it during bootstrap test.
+        if (fs.existsSync(realInputsZipBackup) && !fs.existsSync(realInputsZip)) {
+            fs.renameSync(realInputsZipBackup, realInputsZip);
+        }
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+        // Safety net: restore backup if somehow still present.
+        if (fs.existsSync(realInputsZipBackup) && !fs.existsSync(realInputsZip)) {
+            fs.renameSync(realInputsZipBackup, realInputsZip);
+        }
+    });
+
+    const manifestWithCurrentAsOf = (asOf: string): ExtractsManifest => ([
+        {
+            IsFullExtract: true,
+            LastMdified: asOf,
+            Items: [{
+                Description: 'Spectra dataset', Format: 'CSV', FileSize: 0,
+                FileName: 'spectra_rrl.zip',
+                FileUrl: 'https://cdn.example/spectra_rrl.zip',
+            }],
+        },
+    ]);
+
+    test('noop/current — DB already at remote as_of, no fetch happens', async () => {
+        // Seed an existing DB with meta.as_of equal to the manifest.
+        initializeDatabase(dbPath);
+        const seed = new Database(dbPath);
+        seed.prepare("REPLACE INTO meta (key, value) VALUES ('as_of', '2026-05-12T21:51:36Z')").run();
+        seed.close();
+
+        axiosGetSpy.mockResolvedValueOnce({
+            data: manifestWithCurrentAsOf('2026-05-12T21:51:36Z'),
+        } as any);
+
+        await sync(cfg, 'auto');
+
+        const status = getSyncStatus();
+        expect(status.reason).toBe('current');
+        expect(status.dataAsOf).toBe('2026-05-12T21:51:36.000Z');
+        expect(status.remoteAsOf).toBe('2026-05-12T21:51:36Z');
+        expect(status.behindByHours).toBe(0);
+        // The only axios call should have been the manifest fetch.
+        expect(axiosGetSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('bootstrap — no DB; full sync triggered regardless of mode', async () => {
+        // Move the real inputs zip out of the way so performFullSync uses
+        // the mocked downloadFile instead of copying the local shortcut.
+        if (fs.existsSync(realInputsZip)) {
+            fs.renameSync(realInputsZip, realInputsZipBackup);
+        }
+
+        // The manifest has only the full entry. downloadFile uses axios.get with
+        // responseType: 'stream', so we spy on it too and return a Readable.
+        const fullManifest = manifestWithCurrentAsOf('2026-05-12T21:51:36Z');
+        axiosGetSpy.mockResolvedValueOnce({ data: fullManifest } as any);
+
+        // Build a tiny valid zip in memory for the "download" to return.
+        const fakeZipPath = path.join(scratchDir, 'fake_full.zip');
+        const fakeZip = new AdmZip();
+        fakeZip.addFile('placeholder.txt', Buffer.from('not a csv'));
+        fakeZip.writeZip(fakeZipPath);
+        const fakeBytes = fs.readFileSync(fakeZipPath);
+        const { Readable } = await import('stream');
+        axiosGetSpy.mockResolvedValueOnce({ data: Readable.from(fakeBytes) } as any);
+
+        await sync(cfg, 'auto');
+
+        const status = getSyncStatus();
+        expect(status.reason).toBe('no-db');
+        expect(status.mode).toBe('full');
+        const db = new Database(dbPath, { readonly: true });
+        const row = db.prepare("SELECT value FROM meta WHERE key = 'as_of'").get() as any;
+        db.close();
+        expect(row.value).toBe('2026-05-12T21:51:36Z');
+    });
+
+    test('gap-exceeded — auto mode does NOT trigger full download', async () => {
+        initializeDatabase(dbPath);
+        const seed = new Database(dbPath);
+        seed.prepare("REPLACE INTO meta (key, value) VALUES ('as_of', '2026-05-01T00:00:00Z')").run();
+        seed.close();
+
+        axiosGetSpy.mockResolvedValueOnce({
+            data: manifestWithCurrentAsOf('2026-05-12T21:51:36Z'),
+        } as any);
+
+        await sync(cfg, 'auto');
+
+        const status = getSyncStatus();
+        expect(status.reason).toBe('gap-exceeded');
+        expect(status.mode).toBeUndefined();
+        expect(status.detail).toMatch(/h behind/);
+        expect(axiosGetSpy).toHaveBeenCalledTimes(1); // ONLY the manifest call
     });
 });
