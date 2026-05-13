@@ -71,8 +71,8 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
 
         const secondCall = await client.callTool({ name: 'sync_data', arguments: {} }) as any;
         const responseText = secondCall.content[0].text;
-        // Either still in progress or has completed/failed — either is valid
-        expect(responseText).toMatch(/Sync (in progress|started|failed)/i);
+        // Either still in progress, triggered, completed, or returned freshness/decision info — all valid
+        expect(responseText).toMatch(/Sync (in progress|triggered|failed)|Last decision:|Data as-of:|Last successful sync:/i);
 
         await transport.close();
     }, 25000);

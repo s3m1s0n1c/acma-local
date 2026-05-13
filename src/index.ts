@@ -191,16 +191,32 @@ Search for licence holders (clients) by company name or trading name.
                 name: 'sync_data',
                 description: `
 ### [Data Synchronization]
-Download and import the latest ACMA RRL dataset. Safe to call while server is running.
+Download and import the latest ACMA RRL changes. Safe to call while server is running.
 
 ## Usage
-- Call once to start sync, then poll to check progress
-- Returns progress percentage while syncing
+- Default mode='auto' applies incremental change-zips only (cheap, mobile-friendly).
+- Use mode='full' to force a full extract reimport (~70 MB) when 'gap-exceeded' is reported.
+- Call once to start sync, then poll to check progress.
 
 ## Status fields
 - progress: 0-100%
-- currentTable: which CSV is being imported`,
-                inputSchema: { type: 'object', properties: {} },
+- currentTable: which CSV is being imported
+- dataAsOf: how fresh the local data is (ISO 8601)
+- remoteAsOf: latest available upstream (ISO 8601)
+- behindByHours: derived staleness; 0 when current`,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        mode: {
+                            type: 'string',
+                            enum: ['auto', 'full'],
+                            description:
+                                "'auto' (default) applies incremental change-zips only. " +
+                                "'full' force-pulls and reimports the ~70 MB full extract — " +
+                                "use after a long offline period or to recover from gap-exceeded.",
+                        },
+                    },
+                },
             },
             {
                 name: 'list_sample_queries',
@@ -364,6 +380,16 @@ Generate a KML file from cached query results.
         }
 
         if (name === 'sync_data') {
+            // Trigger the sync (mode defaults to 'auto'). Fire-and-forget; the
+            // user polls by calling sync_data again to read getSyncStatus().
+            const mode = (args as any)?.mode === 'full' ? 'full' : 'auto';
+            if (!getSyncStatus().isSyncing) {
+                // Kick off async; intentionally not awaited so this response is fast.
+                sync(DEFAULT_CONFIG, mode).catch((e: unknown) => {
+                    console.error('[MCP] sync_data background failure:', e);
+                });
+            }
+
             const status = getSyncStatus();
             const decisionLine = status.reason
                 ? `Last decision: ${status.mode ? `${status.mode} sync — ` : ''}${status.reason}` +
@@ -371,17 +397,26 @@ Generate a KML file from cached query results.
                   (status.lastDecisionAt ? ` at ${status.lastDecisionAt}` : '')
                 : null;
 
+            const freshness: string[] = [];
+            if (status.dataAsOf) freshness.push(`Data as-of: ${status.dataAsOf}`);
+            if (status.remoteAsOf) freshness.push(`Remote as-of: ${status.remoteAsOf}`);
+            if (status.behindByHours !== undefined) freshness.push(`Behind by: ${status.behindByHours}h`);
+            if (status.lastSyncAt) freshness.push(`Last successful sync: ${status.lastSyncAt}`);
+
             if (status.isSyncing) {
                 const lines = [
                     `Sync in progress${status.mode ? ` (${status.mode})` : ''}: ${status.progress}% — step: ${status.currentTable ?? 'Initializing'}.`,
                     'Poll sync_data again soon.',
                 ];
                 if (decisionLine) lines.push(decisionLine);
+                if (freshness.length) lines.push(...freshness);
                 return { content: [{ type: 'text', text: lines.join('\n') }] };
             }
-            sync(DEFAULT_CONFIG).catch(err => console.error('[SYNC] Error:', err));
-            const lines = ['Sync started. Call sync_data again to check progress.'];
-            if (decisionLine) lines.push(`Previous run — ${decisionLine}`);
+
+            const lines: string[] = [];
+            if (decisionLine) lines.push(decisionLine);
+            if (freshness.length) lines.push(...freshness);
+            if (lines.length === 0) lines.push('Sync triggered.');
             return { content: [{ type: 'text', text: lines.join('\n') }] };
         }
 
