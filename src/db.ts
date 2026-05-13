@@ -127,7 +127,7 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
     `
   },
   "licence_status": {
-    "ddl": `CREATE TABLE IF NOT EXISTS licence_status(STATUS INTEGER, STATUS_TEXT TEXT);`,
+    "ddl": `CREATE TABLE IF NOT EXISTS licence_status(STATUS TEXT, STATUS_TEXT TEXT);`,
     "post_load_ddl": `CREATE INDEX IF NOT EXISTS licence_status_status_idx ON licence_status(STATUS);`
   },
   "nature_of_service": {
