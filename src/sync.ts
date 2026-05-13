@@ -229,8 +229,6 @@ function applyCsvDiff(csvBuffer: Buffer, tableName: string, db: Database.Databas
     apply();
 }
 
-// SyncMode is defined in Task 3 alongside SyncAction.
-
 /**
  * The reason for the most recent sync decision. Outcome reasons are set at
  * the end of an attempt; decision reasons (`cooldown`, `current`,
@@ -253,7 +251,7 @@ export interface SyncStatus {
     progress: number; // 0-100
     currentTable?: string;
     lastError?: string;
-    /** Executed mode, or 'auto' when no execution occurred (noop / gap-exceeded). */
+    /** The mode of the most recent executed sync. Absent when the last decision was a noop or gap-exceeded. */
     mode?: SyncMode | 'incremental';
     /** Reason / outcome of the most recent decision. */
     reason?: SyncReason;
@@ -309,12 +307,97 @@ async function downloadFile(url: string, targetPath: string): Promise<void> {
 
 /**
  * Performs a full synchronization: download, extract, and import all data.
+ * Takes the full ExtractEntry from the manifest as input — the URL and the
+ * authoritative as_of timestamp both come from there.
  */
-export async function performFullSync(config: SyncConfig, remoteTimestampRaw?: string): Promise<void> {
-    // Body intentionally removed in Task 6 of the migration plan. Task 7
-    // rewrites this around the /v1/Extracts manifest entry.
-    void config; void remoteTimestampRaw;
-    throw new Error('performFullSync body is being rewritten in Task 7; do not invoke between Task 6 and Task 7.');
+export async function performFullSync(config: SyncConfig, fullEntry: ExtractEntry): Promise<void> {
+    if (currentSyncStatus.isSyncing) {
+        throw new Error('Synchronization already in progress');
+    }
+
+    const spectra = pickSpectraRrl(fullEntry.Items);
+    if (!spectra) {
+        throw new Error('Full extract entry has no spectra_rrl item');
+    }
+
+    // Reset transient run state but preserve decision metadata.
+    const { currentTable: _ct, lastError: _le, ...preserved } = currentSyncStatus;
+    void _ct; void _le;
+    currentSyncStatus = { ...preserved, isSyncing: true, progress: 0 };
+
+    try {
+        if (!fs.existsSync(config.dataDir)) {
+            fs.mkdirSync(config.dataDir, { recursive: true });
+        }
+
+        const zipPathFromInput = path.resolve('inputs/spectra_rrl.zip');
+        const zipPath = path.join(config.dataDir, 'spectra_rrl.zip');
+
+        currentSyncStatus.progress = 5;
+
+        const remoteTimestamp = new Date(fullEntry.LastMdified);
+        const inputZipExists = fs.existsSync(zipPathFromInput);
+        const inputZipStale = inputZipExists && isInputZipStale(zipPathFromInput, remoteTimestamp);
+
+        if (inputZipExists && !inputZipStale) {
+            console.log('Using local dataset from inputs/');
+            fs.copyFileSync(zipPathFromInput, zipPath);
+        } else {
+            if (inputZipStale) {
+                const mtime = fs.statSync(zipPathFromInput).mtime.toISOString();
+                console.log(`[SYNC] Input zip mtime=${mtime} is older than remote=${remoteTimestamp.toISOString()}; ignoring stale input.`);
+            }
+            console.log(`Downloading full dataset from ${spectra.FileUrl}...`);
+            await downloadFile(spectra.FileUrl, zipPath);
+        }
+
+        currentSyncStatus.progress = 20;
+
+        console.log('Extracting ZIP...');
+        const extractDir = path.join(config.dataDir, 'extracted');
+        if (!fs.existsSync(extractDir)) fs.mkdirSync(extractDir, { recursive: true });
+        const files = await extractZip(zipPath, extractDir);
+
+        currentSyncStatus.progress = 30;
+
+        console.log('Initializing database...');
+        initializeDatabase(config.dbPath);
+
+        const tablesToImport = files.filter(file => {
+            const fileName = path.basename(file);
+            const targetTable = fileName.split('.')[0]!;
+            return Object.keys(TABLE_METADATA).includes(targetTable);
+        });
+
+        for (let i = 0; i < tablesToImport.length; i++) {
+            const file = tablesToImport[i]!;
+            const fileName = path.basename(file);
+            const targetTable = fileName.split('.')[0]!;
+
+            currentSyncStatus.currentTable = targetTable;
+            const tableProgressBase = 30 + (i / tablesToImport.length) * 65;
+
+            console.log(`Importing ${fileName}...`);
+            await importCsv(file, config.dbPath, targetTable, (p) => {
+                currentSyncStatus.progress = Math.round(
+                    tableProgressBase + (p / tablesToImport.length) * (65 / 100)
+                );
+            });
+        }
+
+        const db = new Database(config.dbPath);
+        db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('as_of', fullEntry.LastMdified);
+        db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('last_sync', new Date().toISOString());
+        db.close();
+
+        currentSyncStatus.progress = 100;
+        console.log('Full sync complete.');
+    } catch (error: any) {
+        currentSyncStatus.lastError = error.message;
+        throw error;
+    } finally {
+        currentSyncStatus.isSyncing = false;
+    }
 }
 
 /**
