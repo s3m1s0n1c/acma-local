@@ -202,6 +202,11 @@ function applyCsvDiff(csvBuffer: Buffer, tableName: string, db: Database.Databas
     if (!columns.includes('CHANGE')) {
         throw new Error(`Expected CHANGE column in ${tableName} change-zip`);
     }
+    const COLUMN_NAME_RE = /^[A-Z_][A-Z0-9_]*$/i;
+    const invalidCol = columns.find(c => !COLUMN_NAME_RE.test(c));
+    if (invalidCol) {
+        throw new Error(`Unexpected column name '${invalidCol}' in ${tableName} change-zip`);
+    }
     const pk = PK_BY_TABLE[tableName]!;
     const dataCols = columns.filter(c => c !== 'CHANGE');
     const placeholders = dataCols.map(() => '?').join(',');

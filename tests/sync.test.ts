@@ -547,4 +547,22 @@ describe('applyCsvDiffZip', () => {
         db.close();
         expect(count).toBe(1);
     });
+
+    test('Updated row that is not yet in DB is inserted (idempotency)', async () => {
+        // DB starts empty. The change-zip contains an Updated row for CLIENT_NO=99.
+        // DELETE-then-INSERT means the DELETE silently matches zero rows, then INSERT
+        // adds the new row. This documents idempotency: replaying a change-zip is safe.
+        buildChangeZip({
+            'client.csv':
+                'CLIENT_NO,LICENCEE,TRADING_NAME,ACN,ABN,POSTAL_STREET,POSTAL_SUBURB,POSTAL_STATE,POSTAL_POSTCODE,CAT_ID,CLIENT_TYPE_ID,FEE_STATUS_ID,CHANGE\n' +
+                '99,Late Arrival,,,,,,,,,,,Updated\n',
+        });
+
+        await applyCsvDiffZip(zipPath, dbPath);
+
+        const db = new Database(dbPath);
+        const row = db.prepare('SELECT CLIENT_NO, LICENCEE FROM client WHERE CLIENT_NO = 99').get() as any;
+        db.close();
+        expect(row).toEqual({ CLIENT_NO: 99, LICENCEE: 'Late Arrival' });
+    });
 });
