@@ -34,6 +34,8 @@ export function getSiteDetails(db: Database.Database, siteId: string) {
   return { site, devices };
 }
 
+// Note: l.* includes licence.STATUS_TEXT (denormalised, may be stale).
+// STATUS_NAME is the authoritative value from the licence_status lookup.
 const LICENCE_SELECT = `
   SELECT l.*,
          sv.SV_NAME     AS SERVICE_NAME,

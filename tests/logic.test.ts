@@ -2,7 +2,6 @@ import {
     searchSites,
     getSiteDetails,
     searchLicences,
-    searchLicencesWithSites,
     searchClients,
     getLicenceDetails,
 } from '../src/logic.js';
