@@ -122,14 +122,16 @@ export function decideSyncAction(
         return { kind: 'noop', reason: 'current' };
     }
     const applicable = manifest
-        .filter(e => !e.IsFullExtract && new Date(e.LastMdified).getTime() > asOf.getTime())
-        .sort((a, b) => new Date(a.LastMdified).getTime() - new Date(b.LastMdified).getTime());
+        .filter(e => !e.IsFullExtract)
+        .map(e => ({ e, t: new Date(e.LastMdified).getTime() }))
+        .filter(({ t }) => t > asOf.getTime())
+        .sort((a, b) => a.t - b.t);
     if (applicable.length === 0 ||
-        new Date(applicable[0]!.LastMdified).getTime() - asOf.getTime() > GAP_TOLERANCE_MS) {
+        applicable[0]!.t - asOf.getTime() > GAP_TOLERANCE_MS) {
         const behindHours = Math.round((fullTime - asOf.getTime()) / 3_600_000);
         return { kind: 'gap-exceeded', behindHours };
     }
-    return { kind: 'incremental', entries: applicable };
+    return { kind: 'incremental', entries: applicable.map(({ e }) => e) };
 }
 
 /**
@@ -403,8 +405,8 @@ export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
 
     // Within the incremental window — attempt incremental sync
     console.log('Checking for incremental updates...');
-    // TODO(Task 6): 'incremental' cast removed when SyncMode is broadened.
-    recordDecision(parsedRemote ? 'within-window' : 'parse-failed', 'incremental' as any,
+    // TODO(Task 6): pass mode='incremental' once SyncMode includes it.
+    recordDecision(parsedRemote ? 'within-window' : 'parse-failed', undefined,
         parsedRemote ? undefined : `unparseable remote timestamp '${remoteTimestampRaw}' — gap check skipped`);
     try {
         const response = await axios.get(config.incrementalUrl);
@@ -417,12 +419,12 @@ export async function sync(config: SyncConfig = DEFAULT_CONFIG): Promise<void> {
             db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('last_sync', new Date().toISOString());
             db.close();
             console.log(`Incremental sync successful. Database is now as-of ${newTimestamp}`);
-            recordDecision('incremental-success', 'incremental' as any, `as-of ${newTimestamp}`);
+            recordDecision('incremental-success', undefined, `as-of ${newTimestamp}`); // TODO(Task 6): pass mode='incremental'.
         }
     } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error('Incremental sync failed.', e);
-        recordDecision('incremental-failed', 'incremental' as any, msg);
+        recordDecision('incremental-failed', undefined, msg); // TODO(Task 6): pass mode='incremental'.
         // No auto-fallback: the gap check above already routed any DB that
         // is genuinely past the incremental window. Remaining failures are
         // transient and will retry on the next scheduled sync.
