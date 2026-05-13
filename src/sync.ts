@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import Database from 'better-sqlite3';
 import { parse } from 'csv-parse';
+import { parse as parseCsvSync } from 'csv-parse/sync';
 import axios from 'axios';
 import { pipeline } from 'stream/promises';
 import { initializeDatabase, TABLE_METADATA } from './db.js';
@@ -132,6 +133,99 @@ export function decideSyncAction(
         return { kind: 'gap-exceeded', behindHours };
     }
     return { kind: 'incremental', entries: applicable.map(({ e }) => e) };
+}
+
+// ── CSV-diff incremental application ─────────────────────────────────────────
+
+/**
+ * Single-column primary keys for the tables we materialise. ACMA's full extract
+ * does not declare PKs and the schema does not enforce them; we use these to
+ * key the DELETE step of incremental application.
+ */
+const PK_BY_TABLE: Record<string, string> = {
+    client: 'CLIENT_NO',
+    licence: 'LICENCE_NO',
+    site: 'SITE_ID',
+    device_details: 'SDD_ID',
+    antenna: 'ANTENNA_ID',
+};
+
+/**
+ * Translates a change-zip CSV basename to a schema table name. ACMA's daily
+ * change-zip names device data `device_detail.csv` (singular) while the full
+ * extract names it `device_details.csv` (plural). Likely an ACMA-side bug; we
+ * handle both here so the diff applier sees a single canonical table name.
+ */
+function csvToTable(csvBasename: string): string {
+    const stem = csvBasename.replace(/\.csv$/i, '');
+    return stem === 'device_detail' ? 'device_details' : stem;
+}
+
+/**
+ * Applies a single daily change-zip to the SQLite database. The zip is the
+ * payload of one https://cdn.acma.gov.au/rrl/changes/spectra_rrl-changes-*.zip
+ * file. Each CSV in the zip carries the table's columns plus a trailing
+ * CHANGE column; rows are Added / Updated / Deleted.
+ */
+export async function applyCsvDiffZip(zipPath: string, dbPath: string): Promise<void> {
+    const zip = new AdmZip(zipPath);
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    try {
+        for (const entry of zip.getEntries()) {
+            if (entry.isDirectory) continue;
+            const baseName = path.basename(entry.entryName);
+            if (!baseName.toLowerCase().endsWith('.csv')) continue;
+            const tableName = csvToTable(baseName);
+            if (!(tableName in PK_BY_TABLE)) continue;   // skip non-materialised tables
+            applyCsvDiff(entry.getData(), tableName, db);
+        }
+    } finally {
+        db.close();
+    }
+}
+
+/**
+ * Applies one CSV diff (the contents of one entry in a change-zip) to the
+ * named table. DELETE-then-INSERT for Added/Updated; DELETE for Deleted.
+ * Idempotent under repeated application, which protects us against replays.
+ */
+function applyCsvDiff(csvBuffer: Buffer, tableName: string, db: Database.Database): void {
+    const rows: Record<string, string>[] = parseCsvSync(csvBuffer, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+    });
+    if (rows.length === 0) return;     // header-only CSV
+
+    const columns = Object.keys(rows[0]!);
+    if (!columns.includes('CHANGE')) {
+        throw new Error(`Expected CHANGE column in ${tableName} change-zip`);
+    }
+    const pk = PK_BY_TABLE[tableName]!;
+    const dataCols = columns.filter(c => c !== 'CHANGE');
+    const placeholders = dataCols.map(() => '?').join(',');
+    const insertStmt = db.prepare(
+        `INSERT INTO ${tableName} (${dataCols.join(',')}) VALUES (${placeholders})`
+    );
+    const deleteStmt = db.prepare(`DELETE FROM ${tableName} WHERE ${pk} = ?`);
+
+    const apply = db.transaction(() => {
+        for (const row of rows) {
+            const change = row.CHANGE;
+            const pkValue = row[pk];
+            if (change === 'Deleted') {
+                deleteStmt.run(pkValue);
+            } else if (change === 'Added' || change === 'Updated') {
+                deleteStmt.run(pkValue);
+                const values = dataCols.map(c => row[c] === '' ? null : row[c]);
+                insertStmt.run(...values);
+            } else {
+                console.warn(`Unknown CHANGE='${change}' in ${tableName}; skipping row pk=${pkValue}`);
+            }
+        }
+    });
+    apply();
 }
 
 /**

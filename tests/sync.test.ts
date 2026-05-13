@@ -1,5 +1,6 @@
 import { extractZip, importCsv, applyIncrementalUpdate, parseRemoteTimestamp, isInputZipStale, shouldDoFullSync } from '../src/sync';
 import { pickSpectraRrl, fetchExtractsManifest, decideSyncAction } from '../src/sync';
+import { applyCsvDiffZip } from '../src/sync';
 import type { ExtractItem, ExtractsManifest, SyncAction } from '../src/sync';
 import { initializeDatabase } from '../src/db';
 import Database from 'better-sqlite3';
@@ -436,5 +437,114 @@ describe('fetchExtractsManifest', () => {
         axiosGetSpy.mockRejectedValueOnce(new Error('network down') as never);
         await expect(fetchExtractsManifest('https://example/v1/Extracts'))
             .rejects.toThrow('network down');
+    });
+});
+
+describe('applyCsvDiffZip', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_csv_diff');
+    const dbPath = path.join(scratchDir, 'test_acma.db');
+    const zipPath = path.join(scratchDir, 'change.zip');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        initializeDatabase(dbPath);
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    function buildChangeZip(files: Record<string, string>): void {
+        const zip = new AdmZip();
+        for (const [name, content] of Object.entries(files)) {
+            zip.addFile(name, Buffer.from(content, 'utf-8'));
+        }
+        zip.writeZip(zipPath);
+    }
+
+    test('Added rows are inserted, Updated rows replace, Deleted rows are removed', async () => {
+        // Seed the client table with two existing rows.
+        const seedDb = new Database(dbPath);
+        seedDb.prepare("INSERT INTO client (CLIENT_NO, LICENCEE) VALUES (1, 'Old Name')").run();
+        seedDb.prepare("INSERT INTO client (CLIENT_NO, LICENCEE) VALUES (2, 'Doomed')").run();
+        seedDb.close();
+
+        // Change zip: add #3, update #1, delete #2.
+        buildChangeZip({
+            'client.csv':
+                'CLIENT_NO,LICENCEE,TRADING_NAME,ACN,ABN,POSTAL_STREET,POSTAL_SUBURB,POSTAL_STATE,POSTAL_POSTCODE,CAT_ID,CLIENT_TYPE_ID,FEE_STATUS_ID,CHANGE\n' +
+                '3,New Corp,,,,,,,,,,,Added\n' +
+                '1,Updated Name,,,,,,,,,,,Updated\n' +
+                '2,,,,,,,,,,,,Deleted\n',
+        });
+
+        await applyCsvDiffZip(zipPath, dbPath);
+
+        const db = new Database(dbPath);
+        const rows = db.prepare('SELECT CLIENT_NO, LICENCEE FROM client ORDER BY CLIENT_NO').all() as any[];
+        db.close();
+        expect(rows).toEqual([
+            { CLIENT_NO: 1, LICENCEE: 'Updated Name' },
+            { CLIENT_NO: 3, LICENCEE: 'New Corp' },
+        ]);
+    });
+
+    test('device_detail.csv (singular) is applied to device_details table (plural)', async () => {
+        // 55-column header: 54 schema cols + CHANGE.
+        const header = [
+            'SDD_ID','LICENCE_NO','DEVICE_REGISTRATION_IDENTIFIER','FORMER_DEVICE_IDENTIFIER',
+            'AUTHORISATION_DATE','CERTIFICATION_METHOD','GROUP_FLAG','SITE_RADIUS','FREQUENCY',
+            'BANDWIDTH','CARRIER_FREQ','EMISSION','DEVICE_TYPE','TRANSMITTER_POWER',
+            'TRANSMITTER_POWER_UNIT','SITE_ID','ANTENNA_ID','POLARISATION','AZIMUTH','HEIGHT',
+            'TILT','FEEDER_LOSS','LEVEL_OF_PROTECTION','EIRP','EIRP_UNIT','SV_ID','SS_ID',
+            'EFL_ID','EFL_FREQ_IDENT','EFL_SYSTEM','LEQD_MODE','RECEIVER_THRESHOLD',
+            'AREA_AREA_ID','CALL_SIGN','AREA_DESCRIPTION','AP_ID','CLASS_OF_STATION_CODE',
+            'SUPPLIMENTAL_FLAG','EQ_FREQ_RANGE_MIN','EQ_FREQ_RANGE_MAX','NATURE_OF_SERVICE_ID',
+            'HOURS_OF_OPERATION','SA_ID','RELATED_EFL_ID','EQP_ID','ANTENNA_MULTI_MODE',
+            'POWER_IND','LPON_CENTER_LONGITUDE','LPON_CENTER_LATITUDE','TCS_ID','TECH_SPEC_ID',
+            'DROPTHROUGH_ID','STATION_TYPE','STATION_NAME','CHANGE',
+        ];
+        // SDD_ID=999, LICENCE_NO='L1', 52 empty cols, CHANGE='Added' → 55 fields.
+        const row = ['999', 'L1', ...new Array(52).fill(''), 'Added'];
+        buildChangeZip({
+            'device_detail.csv': header.join(',') + '\n' + row.join(',') + '\n',
+        });
+
+        await applyCsvDiffZip(zipPath, dbPath);
+
+        const db = new Database(dbPath);
+        const got = db.prepare('SELECT SDD_ID, LICENCE_NO FROM device_details WHERE SDD_ID = 999').get() as any;
+        db.close();
+        expect(got).toEqual({ SDD_ID: 999, LICENCE_NO: 'L1' });
+    });
+
+    test('CSVs for tables not in our schema are skipped silently', async () => {
+        // applic_text_block is in the change zip but not in our schema.
+        buildChangeZip({
+            'applic_text_block.csv':
+                'APTB_ID,APTB_TABLE_PREFIX,APTB_TABLE_ID,LICENCE_NO,APTB_DESCRIPTION,APTB_CATEGORY,APTB_TEXT,APTB_ITEM,CHANGE\n' +
+                '12345,,,,,,,,Deleted\n',
+        });
+        // Should not throw.
+        await expect(applyCsvDiffZip(zipPath, dbPath)).resolves.toBeUndefined();
+    });
+
+    test('header-only CSV (no row changes) is a no-op', async () => {
+        // Insert a row, then apply a change-zip whose client.csv has only a header.
+        const seedDb = new Database(dbPath);
+        seedDb.prepare("INSERT INTO client (CLIENT_NO, LICENCEE) VALUES (42, 'Survivor')").run();
+        seedDb.close();
+
+        buildChangeZip({
+            'client.csv':
+                'CLIENT_NO,LICENCEE,TRADING_NAME,ACN,ABN,POSTAL_STREET,POSTAL_SUBURB,POSTAL_STATE,POSTAL_POSTCODE,CAT_ID,CLIENT_TYPE_ID,FEE_STATUS_ID,CHANGE\n',
+        });
+        await applyCsvDiffZip(zipPath, dbPath);
+
+        const db = new Database(dbPath);
+        const count = (db.prepare('SELECT COUNT(*) AS n FROM client').get() as any).n;
+        db.close();
+        expect(count).toBe(1);
     });
 });
