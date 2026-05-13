@@ -226,6 +226,17 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
       CREATE INDEX IF NOT EXISTS rtb_category_idx ON reports_text_block(RTB_CATEGORY);
     `
   },
+  "applic_text_block_fts": {
+    "ddl": `
+      CREATE VIRTUAL TABLE IF NOT EXISTS applic_text_block_fts USING fts5(
+        APTB_TEXT,
+        APTB_DESCRIPTION,
+        content='applic_text_block',
+        content_rowid='APTB_ID',
+        tokenize='porter unicode61 remove_diacritics 2'
+      );
+    `
+  },
   "meta": {
     "ddl": `
       CREATE TABLE IF NOT EXISTS meta(

@@ -415,6 +415,16 @@ export async function performFullSync(config: SyncConfig, fullEntry: ExtractEntr
             });
         }
 
+        // Rebuild the FTS5 index over the freshly-imported applic_text_block rows.
+        // External-content FTS5 requires an explicit rebuild after bulk import.
+        console.error('Rebuilding FTS5 index over applic_text_block...');
+        const ftsDb = new Database(config.dbPath);
+        try {
+            ftsDb.exec(`INSERT INTO applic_text_block_fts(applic_text_block_fts) VALUES('rebuild');`);
+        } finally {
+            ftsDb.close();
+        }
+
         const db = new Database(config.dbPath);
         try {
             db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('as_of', fullEntry.LastMdified);

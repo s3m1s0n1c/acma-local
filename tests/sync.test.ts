@@ -588,6 +588,39 @@ describe('applyCsvDiffZip', () => {
     });
 });
 
+describe('FTS5: applic_text_block_fts', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_fts5');
+    const dbPath = path.join(scratchDir, 'test_acma.db');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        initializeDatabase(dbPath);
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('FTS5 rebuild populates index from applic_text_block', () => {
+        const db = new Database(dbPath);
+        db.exec(`
+            INSERT INTO applic_text_block (APTB_ID, APTB_TEXT, APTB_DESCRIPTION)
+                VALUES (1, 'Operation must comply with the radio regulations.', 'Radio compliance');
+            INSERT INTO applic_text_block (APTB_ID, APTB_TEXT, APTB_DESCRIPTION)
+                VALUES (2, 'Spurious emissions must be suppressed.', 'Emissions');
+        `);
+        // Rebuild populates the index.
+        db.exec(`INSERT INTO applic_text_block_fts(applic_text_block_fts) VALUES('rebuild');`);
+
+        const hits = db.prepare(`
+            SELECT rowid FROM applic_text_block_fts WHERE applic_text_block_fts MATCH ?
+        `).all('spurious') as any[];
+        db.close();
+        expect(hits.map(h => h.rowid)).toEqual([2]);
+    });
+});
+
 describe('sync() orchestrator (mocked axios)', () => {
     const scratchDir = path.join(__dirname, '../scratch_test_orchestrator');
     const dbPath = path.join(scratchDir, 'test_acma.db');
