@@ -156,6 +156,12 @@ describe('parseRemoteTimestamp', () => {
         expect(d!.toISOString()).toBe('2026-05-12T21:51:36.000Z');
     });
 
+    test('tolerates surrounding whitespace in ISO 8601 form', () => {
+        const d = parseRemoteTimestamp('  2026-05-12T21:51:36Z\n');
+        expect(d).not.toBeNull();
+        expect(d!.toISOString()).toBe('2026-05-12T21:51:36.000Z');
+    });
+
     test('parses ISO 8601 UTC form with fractional seconds', () => {
         const d = parseRemoteTimestamp('2026-05-12T21:51:36.123Z');
         expect(d).not.toBeNull();
