@@ -139,3 +139,82 @@ describe('decodeEmissionDesignator', () => {
         expect(d.warnings.some(w => /bandwidth/i.test(w))).toBe(true);
     });
 });
+
+import { dumpSeedFromCodeTables, bootstrapEmissionTables, applyEmissionReseed } from '../src/emissions.js';
+import { initializeDatabase } from '../src/db.js';
+import Database from 'better-sqlite3';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+describe('seed generation + bootstrap', () => {
+    let tmpDir: string;
+    beforeEach(() => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'emissions-test-'));
+    });
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    test('dumpSeedFromCodeTables produces SQL with all 56 rows', () => {
+        const out = path.join(tmpDir, 'emissions.sql');
+        dumpSeedFromCodeTables(out);
+        const sql = fs.readFileSync(out, 'utf-8');
+        expect(sql).toContain('SAVEPOINT');
+        expect(sql).toContain('RELEASE SAVEPOINT');
+        expect(sql).toContain("INSERT INTO emission_modulation");
+        expect(sql).toContain("'F'");  // FM code
+        expect(sql).toContain("'Facsimile'");  // info_type C description
+        // 18 + 8 + 9 + 15 + 6 = 56 INSERTs.
+        const insertCount = (sql.match(/^INSERT INTO emission_/gm) ?? []).length;
+        expect(insertCount).toBe(56);
+    });
+
+    test('bootstrapEmissionTables seeds an empty DB', () => {
+        const dbPath = path.join(tmpDir, 'test.db');
+        initializeDatabase(dbPath);
+        const seedPath = path.join(tmpDir, 'emissions.sql');
+        dumpSeedFromCodeTables(seedPath);
+
+        const db = new Database(dbPath);
+        try {
+            bootstrapEmissionTables(db, seedPath);
+            const counts = {
+                modulation: (db.prepare('SELECT COUNT(*) AS n FROM emission_modulation').get() as { n: number }).n,
+                signal_nature: (db.prepare('SELECT COUNT(*) AS n FROM emission_signal_nature').get() as { n: number }).n,
+                info_type: (db.prepare('SELECT COUNT(*) AS n FROM emission_info_type').get() as { n: number }).n,
+                signal_detail: (db.prepare('SELECT COUNT(*) AS n FROM emission_signal_detail').get() as { n: number }).n,
+                multiplex: (db.prepare('SELECT COUNT(*) AS n FROM emission_multiplex').get() as { n: number }).n,
+            };
+            expect(counts).toEqual({ modulation: 18, signal_nature: 8, info_type: 9, signal_detail: 15, multiplex: 6 });
+        } finally { db.close(); }
+    });
+
+    test('bootstrapEmissionTables is a no-op when tables are already populated', () => {
+        const dbPath = path.join(tmpDir, 'test.db');
+        initializeDatabase(dbPath);
+        const seedPath = path.join(tmpDir, 'emissions.sql');
+        dumpSeedFromCodeTables(seedPath);
+
+        const db = new Database(dbPath);
+        try {
+            bootstrapEmissionTables(db, seedPath);
+            // Manually mutate a description to detect re-application.
+            db.prepare("UPDATE emission_info_type SET description = 'MUTATED' WHERE code = 'C'").run();
+            bootstrapEmissionTables(db, seedPath);
+            const desc = (db.prepare("SELECT description FROM emission_info_type WHERE code = 'C'").get() as { description: string }).description;
+            expect(desc).toBe('MUTATED');  // bootstrap did not re-apply
+        } finally { db.close(); }
+    });
+
+    test('bootstrapEmissionTables warns and returns when seed file is missing', () => {
+        const dbPath = path.join(tmpDir, 'test.db');
+        initializeDatabase(dbPath);
+        const db = new Database(dbPath);
+        try {
+            expect(() => bootstrapEmissionTables(db, path.join(tmpDir, 'does-not-exist.sql'))).not.toThrow();
+            const n = (db.prepare('SELECT COUNT(*) AS n FROM emission_modulation').get() as { n: number }).n;
+            expect(n).toBe(0);
+        } finally { db.close(); }
+    });
+});
