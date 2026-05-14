@@ -47,7 +47,7 @@ The local SQLite database is kept in step with ACMA via the manifest at `https:/
 
 `src/index.ts` is the entry point. It spins up an Express app exposing `POST /mcp` (initialization + RPC) and `GET /mcp` (SSE notification stream), with `Mcp-Session-Id` correlating both. Each session gets its own `StreamableHTTPServerTransport`. A 30-minute in-memory **result cache** ties `execute_sql` outputs to subsequent `export_kml` calls via `result_id`.
 
-**Tool catalog (15 tools, registered in `index.ts`):** `search_sites`, `get_site_details`, `search_licences`, `get_licence_details`, `search_clients`, `search_bsl`, `search_spectrum_band`, `search_application_text`, `sync_data`, `list_sample_queries`, `execute_sql`, `explain_query`, `export_kml`, `describe_schema`, `describe_tool`.
+**Tool catalog (16 tools, registered in `index.ts`):** `search_sites`, `get_site_details`, `search_licences`, `get_licence_details`, `search_clients`, `search_bsl`, `search_spectrum_band`, `search_application_text`, `get_frequency_allocation`, `sync_data`, `list_sample_queries`, `execute_sql`, `explain_query`, `export_kml`, `describe_schema`, `describe_tool`.
 
 Each tool's `tools/list` entry is a one-line summary + capability tag; the full markdown documentation lives in the `TOOL_DOCS` map and is fetched on demand via `describe_tool(name)`. Search-style tools return `{rows, _hints?}` envelopes — `_hints` carries follow-up tool suggestions (e.g. `search_licences` → `get_licence_details`; geospatial results → `export_kml`).
 
@@ -57,11 +57,12 @@ Each tool's `tools/list` entry is a one-line summary + capability tag; the full 
 
 ### Database
 
-`src/db.ts` declares `TABLE_METADATA` — DDL + post-load indexes for every materialised table. There are 22 tables + `meta` + the FTS5 virtual table `applic_text_block_fts`:
+`src/db.ts` declares `TABLE_METADATA` — DDL + post-load indexes for every materialised table. There are 26 tables + `meta` + the FTS5 virtual table `applic_text_block_fts`:
 
 - **Core 5:** `client`, `licence`, `site`, `device_details`, `antenna`.
 - **Broadcasting + spectrum:** `bsl`, `bsl_area`, `auth_spectrum_freq` (4-col composite PK), `auth_spectrum_area` (2-col composite PK).
 - **Satellite:** `satellite`.
+- **Spectrum plan (lookup-only):** `spectrum_allocations` (with `freq_start_hz`/`freq_end_hz` range index), `spectrum_australian_footnotes`, `spectrum_international_footnotes`, `spectrum_plan_meta`. Populated from `seed/spectrum_plan.sql` (checked in), auto-bootstrapped at the tail of `performFullSync` when empty. Not part of the RRL sync; updates via `npm run import-spectrum-plan -- --patch <file>`.
 - **Narrative:** `applic_text_block` (~168 MB CSV), `reports_text_block`; FTS5 virtual table over `applic_text_block.APTB_TEXT` rebuilt during full sync.
 - **10 lookups:** `client_type`, `fee_status`, `industry_cat`, `licence_service`, `licence_subservice` (composite PK), `licence_status`, `nature_of_service`, `class_of_station`, `licensing_area`, `antenna_polarity`. JOINed by `src/logic.ts` to surface human-readable names.
 
@@ -75,6 +76,7 @@ Runtime introspection: call the `describe_schema` MCP tool (or `describeSchema()
 - **TypeScript flags are strict.** `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`, `isolatedModules` are all on. Optional fields must be *absent* (`{}`) not present-with-undefined (`{ x: undefined }`) — this matters in `SyncStatus` mutation; see `recordDecision` in `src/sync.ts` for the destructure-and-respread pattern.
 - **No `console.log` in production code.** stdio transport reserves stdout for JSON-RPC frames. Use `console.error` for diagnostics (`grep -nE 'console\.(log|warn)' src/sync.ts` should return nothing).
 - **`inputs/spectra_rrl.zip`** is a dev shortcut: if it exists and its mtime is newer than the manifest's `LastMdified`, `performFullSync` copies it instead of downloading. Useful for offline iteration. Don't push this file — it's gitignored via `*.zip`.
+- **Spectrum plan seed.** `seed/spectrum_plan.sql` is the canonical source for `spectrum_*` tables, committed as text for diff-ability. Auto-applied during `performFullSync` when the spectrum tables are empty. To refresh after an ACMA legislative amendment: write a `seed/patches/YYYY-MM-DD-<topic>.sql` patch file, run `npm run import-spectrum-plan -- --patch <path>`, then `npm run dump-spectrum-plan` to regenerate the seed, and commit both.
 
 ## Environment variables
 
