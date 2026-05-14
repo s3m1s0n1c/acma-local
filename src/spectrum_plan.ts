@@ -141,6 +141,40 @@ export function applyReseed(db: BetterSqlite3Database, sourcePath: string): void
 }
 
 /**
+ * Dump the four spectrum_* tables to a .sql file suitable for re-applying
+ * via applyReseed(). DDL is owned by TABLE_METADATA so we only emit
+ * INSERT statements wrapped in a single transaction.
+ */
+export function dumpSpectrumPlan(db: BetterSqlite3Database, outPath: string): void {
+    const lines: string[] = ['BEGIN TRANSACTION;'];
+
+    for (const table of SPECTRUM_TABLES) {
+        const rows = db.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
+        if (rows.length === 0) continue;
+        const cols = Object.keys(rows[0]!);
+        const colList = cols.join(', ');
+        for (const row of rows) {
+            const values = cols.map(c => sqlLiteral(row[c])).join(', ');
+            lines.push(`INSERT INTO ${table}(${colList}) VALUES(${values});`);
+        }
+    }
+
+    lines.push('COMMIT;');
+    fs.writeFileSync(outPath, lines.join('\n') + '\n');
+    console.error(`[SPECTRUM] Wrote ${outPath} (${lines.length - 2} INSERT statements)`);
+}
+
+function sqlLiteral(v: unknown): string {
+    if (v === null || v === undefined) return 'NULL';
+    if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'NULL';
+    if (typeof v === 'bigint') return v.toString();
+    if (typeof v === 'boolean') return v ? '1' : '0';
+    // Strings: double single quotes, wrap in single quotes.
+    const s = String(v).replace(/'/g, "''");
+    return `'${s}'`;
+}
+
+/**
  * Copy data from a pre-built source SQLite database into the runtime spectrum_* tables.
  * The source uses the legacy schema (frequency_range TEXT + unit TEXT); we normalise
  * to freq_start_hz/freq_end_hz here using parseFrequencyRange.

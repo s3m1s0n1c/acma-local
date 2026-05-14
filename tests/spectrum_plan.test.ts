@@ -248,3 +248,92 @@ COMMIT;`;
         } finally { db.close(); }
     });
 });
+
+import { dumpSpectrumPlan } from '../src/spectrum_plan';
+
+describe('dumpSpectrumPlan', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_spectrum_dump');
+    const dbPathA = path.join(scratchDir, 'a.db');
+    const dbPathB = path.join(scratchDir, 'b.db');
+    const seedPath = path.join(scratchDir, 'roundtrip.sql');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        for (const p of [dbPathA, dbPathB, seedPath]) {
+            if (fs.existsSync(p)) fs.unlinkSync(p);
+        }
+        initializeDatabase(dbPathA);
+        initializeDatabase(dbPathB);
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('round-trip: populate -> dump -> reapply produces identical row counts', () => {
+        const initialSeed = `
+BEGIN TRANSACTION;
+INSERT INTO spectrum_allocations VALUES(87000000, 88000000, '87-88', 'MHz', '', '', 'BROADCASTING', '', '', '5.87 AUS37');
+INSERT INTO spectrum_allocations VALUES(108000000, 137000000, '108-137', 'MHz', '', '', 'AERONAUTICAL MOBILE (R)', '', '', '5.198');
+INSERT INTO spectrum_australian_footnotes VALUES('AUS37', 'AU body');
+INSERT INTO spectrum_international_footnotes VALUES('5.87', '5.87 body');
+INSERT INTO spectrum_international_footnotes VALUES('5.198', '5.198 body');
+INSERT INTO spectrum_plan_meta VALUES('published_date', '2018-01-01');
+COMMIT;
+        `.trim();
+        fs.writeFileSync(seedPath, initialSeed);
+
+        const a = new Database(dbPathA);
+        applyReseed(a, seedPath);
+
+        const dumpedPath = path.join(scratchDir, 'dumped.sql');
+        dumpSpectrumPlan(a, dumpedPath);
+        a.close();
+
+        expect(fs.existsSync(dumpedPath)).toBe(true);
+        const dumped = fs.readFileSync(dumpedPath, 'utf-8');
+        expect(dumped).toMatch(/^BEGIN TRANSACTION;/);
+        expect(dumped.trim()).toMatch(/COMMIT;$/);
+
+        const b = new Database(dbPathB);
+        applyReseed(b, dumpedPath);
+        try {
+            const allocs = (b.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+            const aus = (b.prepare('SELECT COUNT(*) AS n FROM spectrum_australian_footnotes').get() as { n: number }).n;
+            const intls = (b.prepare('SELECT COUNT(*) AS n FROM spectrum_international_footnotes').get() as { n: number }).n;
+            expect(allocs).toBe(2);
+            expect(aus).toBe(1);
+            expect(intls).toBe(2);
+
+            const published = (b.prepare("SELECT value FROM spectrum_plan_meta WHERE key='published_date'").get() as { value: string }).value;
+            expect(published).toBe('2018-01-01');
+        } finally { b.close(); }
+    });
+
+    test('quotes single quotes in text values correctly', () => {
+        const db = new Database(dbPathA);
+        db.exec("INSERT INTO spectrum_australian_footnotes VALUES('AUS99', 'O''Reilly''s footnote text')");
+        const out = path.join(scratchDir, 'quotes.sql');
+        dumpSpectrumPlan(db, out);
+        db.close();
+
+        const b = new Database(dbPathB);
+        applyReseed(b, out);
+        try {
+            const row = b.prepare("SELECT footnote_text FROM spectrum_australian_footnotes WHERE footnote_ref='AUS99'").get() as { footnote_text: string };
+            expect(row.footnote_text).toBe("O'Reilly's footnote text");
+        } finally { b.close(); }
+    });
+
+    test('handles NULL values, numbers, and bigints', () => {
+        const db = new Database(dbPathA);
+        db.exec("INSERT INTO spectrum_allocations(freq_start_hz, freq_end_hz, frequency_range, unit) VALUES(NULL, 99, 'test', NULL)");
+        const out = path.join(scratchDir, 'mixed.sql');
+        dumpSpectrumPlan(db, out);
+        db.close();
+
+        const dumped = fs.readFileSync(out, 'utf-8');
+        // NULL values must appear as the SQL token NULL, not 'NULL' (quoted)
+        expect(dumped).toMatch(/NULL.*99.*'test'.*NULL/);
+    });
+});
