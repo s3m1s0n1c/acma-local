@@ -1,4 +1,4 @@
-import { executeSql, listSampleQueries, executeSqlWithTimeout } from '../src/sql.js';
+import { executeSql, listSampleQueries, executeSqlWithTimeout, describeSchema } from '../src/sql.js';
 import { initializeDatabase } from '../src/db.js';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -7,6 +7,9 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const scratchDir_p2 = path.join(__dirname, '../scratch_test_describe_schema');
+const dbPath_p2 = path.join(scratchDir_p2, 'test_acma.db');
 
 describe('executeSql', () => {
     const scratchDir = path.join(__dirname, '../scratch_test_sql');
@@ -154,5 +157,58 @@ describe('executeSqlWithTimeout', () => {
             executeSqlWithTimeout(dbPath, "DROP TABLE site", 100, 5000)
         ).rejects.toThrow(/SELECT/i);
     }, 10000);
+});
+
+describe('describeSchema', () => {
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir_p2)) fs.mkdirSync(scratchDir_p2);
+        if (fs.existsSync(dbPath_p2)) fs.unlinkSync(dbPath_p2);
+        initializeDatabase(dbPath_p2);
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir_p2)) fs.rmSync(scratchDir_p2, { recursive: true, force: true });
+    });
+
+    test('describeSchema returns all tables when called without filter', () => {
+        const db = new Database(dbPath_p2);
+        const result = describeSchema(db);
+        db.close();
+        const names = result.map(t => t.name).sort();
+        expect(names).toContain('client');
+        expect(names).toContain('bsl');
+        expect(names).toContain('auth_spectrum_freq');
+        expect(names).toContain('applic_text_block');
+        expect(names).toContain('applic_text_block_fts');
+        expect(names).toContain('meta');
+    });
+
+    test('describeSchema filters by table names', () => {
+        const db = new Database(dbPath_p2);
+        const result = describeSchema(db, ['client', 'bsl']);
+        db.close();
+        expect(result).toHaveLength(2);
+        expect(result.map(t => t.name).sort()).toEqual(['bsl', 'client']);
+    });
+
+    test('describeSchema exposes column types and PK columns', () => {
+        const db = new Database(dbPath_p2);
+        const result = describeSchema(db, ['licence']);
+        db.close();
+        const licence = result[0]!;
+        expect(licence.columns.find(c => c.name === 'LICENCE_NO')).toBeDefined();
+        expect(licence.columns.find(c => c.name === 'STATUS')?.type).toBe('TEXT');
+        // Indexes from post_load_ddl
+        expect(licence.indexes.length).toBeGreaterThan(0);
+        expect(licence.indexes.find(i => i.columns.includes('LICENCE_NO'))).toBeDefined();
+    });
+
+    test('describeSchema flags FTS5 virtual tables', () => {
+        const db = new Database(dbPath_p2);
+        const result = describeSchema(db, ['applic_text_block_fts']);
+        db.close();
+        expect(result).toHaveLength(1);
+        expect(result[0]!.isVirtual).toBe(true);
+    });
 });
 

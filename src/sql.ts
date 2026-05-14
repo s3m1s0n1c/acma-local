@@ -56,6 +56,82 @@ export function executeSql(
     return { columns, rows, truncated, rowCount: rows.length };
 }
 
+export interface TableDescription {
+    name: string;
+    columns: Array<{ name: string; type: string; notnull: boolean; pk: boolean }>;
+    indexes: Array<{ name: string; columns: string[]; unique: boolean }>;
+    rowCount: number;
+    isVirtual: boolean;
+}
+
+/**
+ * Returns column, index, and row-count metadata for the named tables.
+ * When `tables` is omitted, returns descriptions for every user table.
+ * Uses PRAGMA queries; safe to call on a read-only connection.
+ */
+export function describeSchema(
+    db: Database.Database,
+    tables?: string[]
+): TableDescription[] {
+    const masterRows = db.prepare(
+        `SELECT name, type, sql FROM sqlite_master
+         WHERE type IN ('table', 'virtual')
+            OR (type = 'table' AND sql IS NOT NULL)
+         ORDER BY name`
+    ).all() as Array<{ name: string; type: string; sql: string | null }>;
+
+    // Drop SQLite internal tables (sqlite_*, FTS5 shadow tables ending in _data/_idx/_content/_docsize/_config).
+    const isUserTable = (name: string) =>
+        !name.startsWith('sqlite_') &&
+        !/_(data|idx|content|docsize|config)$/.test(name);
+
+    let userTables = masterRows.filter(r => isUserTable(r.name));
+
+    if (tables && tables.length > 0) {
+        const wanted = new Set(tables.map(t => t.toLowerCase()));
+        userTables = userTables.filter(r => wanted.has(r.name.toLowerCase()));
+    }
+
+    return userTables.map(({ name, sql }) => {
+        const isVirtual = sql !== null && /CREATE\s+VIRTUAL\s+TABLE/i.test(sql);
+
+        const colRows = db.prepare(`PRAGMA table_info(${name})`).all() as Array<{
+            name: string; type: string; notnull: number; pk: number;
+        }>;
+        const columns = colRows.map(c => ({
+            name: c.name,
+            type: c.type,
+            notnull: c.notnull !== 0,
+            pk: c.pk !== 0,
+        }));
+
+        const idxRows = db.prepare(`PRAGMA index_list(${name})`).all() as Array<{
+            name: string; unique: number;
+        }>;
+        const indexes = idxRows
+            .filter(i => !i.name.startsWith('sqlite_autoindex_'))
+            .map(i => {
+                const cols = db.prepare(`PRAGMA index_info(${i.name})`).all() as Array<{ name: string }>;
+                return {
+                    name: i.name,
+                    columns: cols.map(c => c.name),
+                    unique: i.unique !== 0,
+                };
+            });
+
+        let rowCount = 0;
+        try {
+            const r = db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get() as { n: number };
+            rowCount = r.n;
+        } catch {
+            // Virtual tables may not support COUNT(*) directly; leave at 0.
+            rowCount = 0;
+        }
+
+        return { name, columns, indexes, rowCount, isVirtual };
+    });
+}
+
 export interface SampleQuery {
     description: string;
     query: string;

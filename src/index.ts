@@ -27,7 +27,7 @@ import {
     searchSpectrumBand,
     searchApplicationText,
 } from './logic.js';
-import { executeSqlWithTimeout, listSampleQueries } from './sql.js';
+import { executeSqlWithTimeout, listSampleQueries, describeSchema } from './sql.js';
 import { generateKml } from './kml.js';
 
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
@@ -305,6 +305,20 @@ Array of { description, query } objects`,
                 inputSchema: { type: 'object', properties: {} },
             },
             {
+                name: 'describe_schema',
+                description: '[Schema Introspection] Returns columns, indexes, and row counts for one or more tables. Omit `tables` for all materialised tables.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        tables: {
+                            type: 'array',
+                            items: { type: 'string' },
+                            description: 'Optional list of table names (case-insensitive); omit for all.',
+                        },
+                    },
+                },
+            },
+            {
                 name: 'execute_sql',
                 description: `
 ### [SQL Query Executor]
@@ -534,6 +548,14 @@ Generate a KML file from cached query results.
         if (name === 'list_sample_queries') {
             const queries = listSampleQueries();
             return { content: [{ type: 'text', text: JSON.stringify(queries, null, 2) }] };
+        }
+
+        if (name === 'describe_schema') {
+            const db = openDb();
+            try {
+                const result = describeSchema(db, args?.tables as string[] | undefined);
+                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+            } finally { db.close(); }
         }
 
         if (name === 'execute_sql') {
