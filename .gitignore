@@ -4,6 +4,8 @@ scratch*/
 dist/
 .DS_Store
 *.db
+*.db-shm
+*.db-wal
 *.zip
 *.rrl_update
 extracted/
@@ -12,4 +14,5 @@ fresh/
 compare/
 *.js.diff
 offline_rrl*.js
+docs/superpowers/
 
