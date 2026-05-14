@@ -39,9 +39,14 @@ export function parseFrequencyRange(rangeText: string, unit: string): { freq_sta
     // Normalise en-dash to ASCII hyphen.
     const normalised = stripped.replace(/–/g, '-');
 
-    // Open-ended entry: "3000-" → top-of-spectrum sentinel for both bounds.
-    if (/^\d+(\.\d+)?\s*-\s*$/.test(normalised)) {
-        return { freq_start_hz: TOP_OF_SPECTRUM_HZ, freq_end_hz: TOP_OF_SPECTRUM_HZ };
+    // Open-ended entry: "3000-" → parse actual start; freq_end_hz uses 3 THz sentinel.
+    const openMatch = normalised.match(/^(\d+(?:\.\d+)?)\s*-\s*$/);
+    if (openMatch) {
+        const start = Number(openMatch[1]);
+        return {
+            freq_start_hz: Math.round(start * multiplier),
+            freq_end_hz: TOP_OF_SPECTRUM_HZ,
+        };
     }
 
     const parts = normalised.split(/\s*-\s*/);

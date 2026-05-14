@@ -62,7 +62,14 @@ describe('parseFrequencyRange', () => {
     });
 
     test('throws on malformed range', () => {
-        expect(() => parseFrequencyRange('not-a-range', 'MHz')).toThrow();
+        expect(() => parseFrequencyRange('not-a-range', 'MHz')).toThrow(/malformed range/i);
+    });
+
+    test('open-ended range with non-sentinel start (1 GHz open-ended)', () => {
+        expect(parseFrequencyRange('1-', 'GHz')).toEqual({
+            freq_start_hz: 1_000_000_000,
+            freq_end_hz: 3_000_000_000_000,
+        });
     });
 
     test('throws when end < start', () => {
