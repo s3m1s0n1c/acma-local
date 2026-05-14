@@ -167,8 +167,8 @@ COMMIT;
                 region1 TEXT, region2 TEXT, region3 TEXT,
                 australian_table_of_allocations TEXT, common TEXT, footnote_ref TEXT
             );
-            CREATE TABLE australian_footnotes(footnote_ref TEXT, footnote_text TEXT);
-            CREATE TABLE international_footnotes(footnote_ref TEXT, footnote_text TEXT);
+            CREATE TABLE australian_footnotes(ref TEXT, text TEXT);
+            CREATE TABLE international_footnotes(ref TEXT, text TEXT);
             INSERT INTO allocations VALUES('87-88', 'MHz', '', '', 'BROADCASTING', 'BROADCASTING', 'FM broadcast band', '5.87 AUS37');
             INSERT INTO australian_footnotes VALUES('AUS37', 'AU body');
             INSERT INTO international_footnotes VALUES('5.87', '5.87 body');
@@ -204,8 +204,8 @@ COMMIT;
                 frequency_range TEXT, unit TEXT, region1 TEXT, region2 TEXT, region3 TEXT,
                 australian_table_of_allocations TEXT, common TEXT, footnote_ref TEXT
             );
-            CREATE TABLE australian_footnotes(footnote_ref TEXT, footnote_text TEXT);
-            CREATE TABLE international_footnotes(footnote_ref TEXT, footnote_text TEXT);
+            CREATE TABLE australian_footnotes(ref TEXT, text TEXT);
+            CREATE TABLE international_footnotes(ref TEXT, text TEXT);
             INSERT INTO allocations VALUES('87-88', NULL, '', '', 'BROADCASTING', '', '', '');
             INSERT INTO allocations VALUES(NULL, 'MHz', '', '', 'BROADCASTING', '', '', '');
             INSERT INTO allocations VALUES('87-88', 'MHz', '', '', 'BROADCASTING', '', '', '');
