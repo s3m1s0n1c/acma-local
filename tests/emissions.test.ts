@@ -217,4 +217,39 @@ describe('seed generation + bootstrap', () => {
             expect(n).toBe(0);
         } finally { db.close(); }
     });
+
+    test('applyEmissionReseed throws when seed file is missing', () => {
+        const dbPath = path.join(tmpDir, 'test.db');
+        initializeDatabase(dbPath);
+        const db = new Database(dbPath);
+        try {
+            expect(() => applyEmissionReseed(db, path.join(tmpDir, 'nope.sql'))).toThrow(/seed not found/);
+        } finally { db.close(); }
+    });
+
+    test('applyEmissionReseed rolls back on malformed SQL', () => {
+        const dbPath = path.join(tmpDir, 'test.db');
+        initializeDatabase(dbPath);
+        const seedPath = path.join(tmpDir, 'emissions.sql');
+        dumpSeedFromCodeTables(seedPath);
+
+        const db = new Database(dbPath);
+        try {
+            // Seed normally first so we know the rollback restores a real state.
+            applyEmissionReseed(db, seedPath);
+            const beforeCount = (db.prepare('SELECT COUNT(*) AS n FROM emission_modulation').get() as { n: number }).n;
+            expect(beforeCount).toBe(18);
+
+            // Now feed it a broken seed.
+            const badSeedPath = path.join(tmpDir, 'bad.sql');
+            fs.writeFileSync(badSeedPath, 'SAVEPOINT emissions_load;\nINSERT INTO emission_modulation(code, description, group_name) VALUES (\'BAD\', \'bad\', \'bad\');\nSELECT * FROM nonexistent_table;\nRELEASE SAVEPOINT emissions_load;\n');
+            expect(() => applyEmissionReseed(db, badSeedPath)).toThrow();
+
+            // Rollback should have restored the prior state — 18 rows, no 'BAD' row.
+            const afterCount = (db.prepare('SELECT COUNT(*) AS n FROM emission_modulation').get() as { n: number }).n;
+            expect(afterCount).toBe(18);
+            const bad = db.prepare("SELECT code FROM emission_modulation WHERE code = 'BAD'").get();
+            expect(bad).toBeUndefined();
+        } finally { db.close(); }
+    });
 });

@@ -296,7 +296,8 @@ export function dumpSeedFromCodeTables(outPath: string): void {
     lines.push('RELEASE SAVEPOINT emissions_load;');
 
     fs.writeFileSync(outPath, lines.join('\n') + '\n');
-    log.info(`[EMISSIONS] Wrote ${outPath} (56 INSERT statements across 5 tables)`);
+    const insertCount = lines.filter(l => l.startsWith('INSERT')).length;
+    log.info(`[EMISSIONS] Wrote ${outPath} (${insertCount} INSERT statements across 5 tables)`);
 }
 
 /**
@@ -311,6 +312,10 @@ export function applyEmissionReseed(db: BetterSqlite3Database, seedPath: string)
     const savepoint = 'emissions_reseed_outer';
     db.exec(`SAVEPOINT ${savepoint}`);
     try {
+        // Defensive wipe before applying the seed. The generated seed file
+        // also contains DELETEs at its head, but a hand-crafted seed (used
+        // via --source) may not — this loop is what makes applyEmissionReseed
+        // a safe "wipe and load" operation regardless of seed file contents.
         for (const t of EMISSION_TABLES) db.exec(`DELETE FROM ${t};`);
         // The seed file declares its own inner SAVEPOINT; savepoints nest fine.
         db.exec(sql);
