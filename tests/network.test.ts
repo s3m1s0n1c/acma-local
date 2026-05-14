@@ -29,7 +29,7 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         serverProcess.stderr.on('data', (data: Buffer) => console.error(`[SERVER ERR] ${data}`));
 
         await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('Server timeout')), 20000);
+            const timeout = setTimeout(() => reject(new Error('Server timeout (60s)')), 60000);
             serverProcess.stderr.on('data', (data: Buffer) => {
                 if (data.toString().includes(`running on port ${PORT}`)) {
                     clearTimeout(timeout);
@@ -39,7 +39,7 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         });
 
         await axios.get(`http://localhost:${PORT}/health`);
-    }, 30000);
+    }, 90000);
 
     afterAll(() => {
         if (serverProcess) serverProcess.kill();

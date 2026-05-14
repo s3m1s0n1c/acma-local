@@ -8,7 +8,9 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "jest",
+    "test": "NODE_OPTIONS='--experimental-vm-modules' jest --testPathIgnorePatterns=tests/network.test.ts",
+    "test:integration": "NODE_OPTIONS='--experimental-vm-modules' jest tests/network.test.ts",
+    "test:all": "NODE_OPTIONS='--experimental-vm-modules' jest",
     "dev": "tsx src/index.ts",
     "sync": "tsx src/sync.ts",
     "import-spectrum-plan": "tsx src/import_spectrum_plan.ts",

@@ -13,12 +13,14 @@ npm install                    # initial setup; needs Node >= 18
 npm run dev                    # tsx src/index.ts — Streamable HTTP server on $PORT (default 3000)
 npm run sync                   # tsx src/sync.ts — one-shot CLI sync
 npm run build                  # tsc → dist/ (ESM)
-npm test                       # full Jest suite
+npm test                       # fast Jest suite — excludes tests/network.test.ts
+npm run test:integration       # network end-to-end suite (spawns a real dev server)
+npm run test:all               # both
 
 # Run a single test file:
 npm test -- tests/sync.test.ts
-# Or by name pattern (note: project uses ts-jest's ESM preset, so direct jest invocations
-# need the experimental VM modules flag — `npm test` already sets this via the test script):
+# Or by name pattern. `npm test` now sets NODE_OPTIONS='--experimental-vm-modules'
+# (required by ts-jest's ESM preset); direct jest invocations need it explicitly:
 NODE_OPTIONS='--experimental-vm-modules' npx jest tests/sync.test.ts -t 'decideSyncAction'
 ```
 
