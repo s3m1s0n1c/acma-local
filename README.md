@@ -31,8 +31,8 @@ Search-style results return an `_hints` array suggesting plausible follow-up too
 Requires Node ≥ 18.
 
 ```bash
-git clone <repo-url>
-cd acma-local-redux
+git clone https://github.com/ciphernaut/acma-local.git
+cd acma-local
 npm install
 ```
 
@@ -49,9 +49,11 @@ The spectrum-plan tables auto-populate from `seed/spectrum_plan.sql` at the tail
 ## Running
 
 ```bash
-npm run dev              # tsx src/index.ts — Streamable HTTP server on $PORT (default 3000)
-npm run build && node dist/index.js   # production
+npm run dev                    # tsx src/index.ts — development mode, live reload
+npm run build && npm start     # production (compiled to dist/, then node dist/index.js)
 ```
+
+The server listens on `$PORT` (default `3000`) and exposes the MCP endpoint at `http://localhost:$PORT/mcp` plus a liveness probe at `/health`. It handles `SIGTERM` and `SIGINT` gracefully — closes MCP transports, finishes in-flight requests, exits cleanly within 30 seconds.
 
 For stdio mode (Claude Desktop), point the client at the compiled entry point — see [MCP client configuration](#mcp-client-configuration).
 

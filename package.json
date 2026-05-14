@@ -15,6 +15,7 @@
     "test:integration": "NODE_OPTIONS='--experimental-vm-modules' jest tests/network.test.ts",
     "test:all": "NODE_OPTIONS='--experimental-vm-modules' jest",
     "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
     "sync": "tsx src/sync.ts",
     "import-spectrum-plan": "tsx src/import_spectrum_plan.ts",
     "dump-spectrum-plan": "tsx src/import_spectrum_plan.ts dump",
