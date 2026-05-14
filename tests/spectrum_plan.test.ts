@@ -394,6 +394,86 @@ COMMIT;
     });
 });
 
+import { lookupFrequencyAllocation } from '../src/spectrum_plan';
+
+describe('lookupFrequencyAllocation', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_spectrum_lookup');
+    const dbPath = path.join(scratchDir, 'test.db');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        initializeDatabase(dbPath);
+        const db = new Database(dbPath);
+        db.exec(`
+            INSERT INTO spectrum_allocations VALUES(87000000, 108000000, '87-108', 'MHz', '', '', 'BROADCASTING', 'BROADCASTING', 'FM broadcast band', '5.87 AUS37');
+            INSERT INTO spectrum_australian_footnotes VALUES('AUS37', 'AUS37 body.');
+            INSERT INTO spectrum_international_footnotes VALUES('5.87', '5.87 ITU body.');
+            INSERT INTO spectrum_plan_meta VALUES('source_description', 'Test fixture');
+            INSERT INTO spectrum_plan_meta VALUES('published_date', '2018-01-01');
+            INSERT INTO spectrum_plan_meta VALUES('imported_at', '2026-05-14T03:00:00Z');
+        `);
+        db.close();
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('returns matching allocation with joined footnotes', () => {
+        const db = new Database(dbPath);
+        try {
+            const result = lookupFrequencyAllocation(db, 87_100_000, true);
+            expect(result.match_count).toBe(1);
+            expect(result.allocations).toHaveLength(1);
+            const a = result.allocations[0]!;
+            expect(a.frequency_range).toBe('87-108');
+            expect(a.unit).toBe('MHz');
+            expect(a.australian_table_of_allocations).toBe('BROADCASTING');
+            expect(a.footnotes!.australian).toEqual([{ ref: 'AUS37', text: 'AUS37 body.' }]);
+            expect(a.footnotes!.international).toEqual([{ ref: '5.87', text: '5.87 ITU body.' }]);
+        } finally { db.close(); }
+    });
+
+    test('omits footnotes when include_footnotes=false', () => {
+        const db = new Database(dbPath);
+        try {
+            const result = lookupFrequencyAllocation(db, 87_100_000, false);
+            expect(result.allocations[0]!.footnotes).toBeUndefined();
+        } finally { db.close(); }
+    });
+
+    test('returns match_count=0 for unallocated frequency', () => {
+        const db = new Database(dbPath);
+        try {
+            const result = lookupFrequencyAllocation(db, 1, true);
+            expect(result.match_count).toBe(0);
+            expect(result.allocations).toEqual([]);
+        } finally { db.close(); }
+    });
+
+    test('exposes source provenance', () => {
+        const db = new Database(dbPath);
+        try {
+            const result = lookupFrequencyAllocation(db, 87_100_000, true);
+            expect(result.source.description).toBe('Test fixture');
+            expect(result.source.published_date).toBe('2018-01-01');
+            expect(result.source.imported_at).toBe('2026-05-14T03:00:00Z');
+            expect(result.source.last_patch_date).toBeNull();
+        } finally { db.close(); }
+    });
+
+    test('formats frequency_display correctly across bands', () => {
+        const db = new Database(dbPath);
+        try {
+            expect(lookupFrequencyAllocation(db, 500, true).frequency_display).toBe('500 Hz');
+            expect(lookupFrequencyAllocation(db, 1_500, true).frequency_display).toBe('1.500 kHz');
+            expect(lookupFrequencyAllocation(db, 87_100_000, true).frequency_display).toBe('87.100 MHz');
+            expect(lookupFrequencyAllocation(db, 2_400_000_000, true).frequency_display).toBe('2.400 GHz');
+        } finally { db.close(); }
+    });
+});
+
 describe('applyPatch', () => {
     const scratchDir = path.join(__dirname, '../scratch_test_spectrum_patch');
     const dbPath = path.join(scratchDir, 'test.db');

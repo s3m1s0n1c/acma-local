@@ -266,6 +266,117 @@ export function bootstrapSpectrumPlan(db: BetterSqlite3Database, seedPath: strin
     }
 }
 
+export interface FootnoteEntry {
+    ref: string;
+    text: string;
+}
+
+export interface AllocationEntry {
+    frequency_range: string;
+    unit: string;
+    region1: string;
+    region2: string;
+    region3: string;
+    australian_table_of_allocations: string;
+    common: string;
+    footnote_ref: string;
+    footnotes?: {
+        australian: FootnoteEntry[];
+        international: FootnoteEntry[];
+    };
+}
+
+export interface SourceProvenance {
+    description: string | null;
+    published_date: string | null;
+    last_patch_date: string | null;
+    imported_at: string | null;
+}
+
+export interface FrequencyAllocationResult {
+    freq_hz: number;
+    frequency_display: string;
+    match_count: number;
+    allocations: AllocationEntry[];
+    source: SourceProvenance;
+}
+
+/**
+ * Look up the ARSP allocation(s) covering a given frequency in Hz.
+ *
+ * Returns matching rows with their footnotes joined (when include_footnotes
+ * is true) plus a source-provenance block. Always returns an array shape
+ * (`allocations: []`) regardless of match count.
+ */
+export function lookupFrequencyAllocation(
+    db: BetterSqlite3Database,
+    freq_hz: number,
+    include_footnotes: boolean,
+): FrequencyAllocationResult {
+    const rows = db.prepare(`
+        SELECT frequency_range, unit, region1, region2, region3,
+               australian_table_of_allocations, common, footnote_ref
+        FROM spectrum_allocations
+        WHERE ? BETWEEN freq_start_hz AND freq_end_hz
+        ORDER BY freq_start_hz, freq_end_hz
+    `).all(freq_hz) as Array<Omit<AllocationEntry, 'footnotes'>>;
+
+    const allocations: AllocationEntry[] = rows.map(r => {
+        const entry: AllocationEntry = { ...r };
+        if (include_footnotes) {
+            entry.footnotes = resolveFootnotes(db, r.footnote_ref ?? '');
+        }
+        return entry;
+    });
+
+    return {
+        freq_hz,
+        frequency_display: formatFrequency(freq_hz),
+        match_count: allocations.length,
+        allocations,
+        source: readSourceProvenance(db),
+    };
+}
+
+function resolveFootnotes(db: BetterSqlite3Database, footnoteRef: string): { australian: FootnoteEntry[]; international: FootnoteEntry[] } {
+    const tokens = footnoteRef.split(/[\s,]+/).filter(t => t.length > 0);
+    const auTokens = tokens.filter(t => /^AUS/i.test(t));
+    const intlTokens = tokens.filter(t => !/^AUS/i.test(t));
+
+    const fetch = (table: string, refs: string[]): FootnoteEntry[] => {
+        if (refs.length === 0) return [];
+        const placeholders = refs.map(() => '?').join(',');
+        const rows = db.prepare(`SELECT footnote_ref AS ref, footnote_text AS text FROM ${table} WHERE footnote_ref IN (${placeholders})`).all(...refs) as FootnoteEntry[];
+        // Preserve input order:
+        const byRef = new Map(rows.map(r => [r.ref, r]));
+        return refs.map(r => byRef.get(r)).filter((r): r is FootnoteEntry => r !== undefined);
+    };
+
+    return {
+        australian: fetch('spectrum_australian_footnotes', auTokens),
+        international: fetch('spectrum_international_footnotes', intlTokens),
+    };
+}
+
+function readSourceProvenance(db: BetterSqlite3Database): SourceProvenance {
+    const rows = db.prepare('SELECT key, value FROM spectrum_plan_meta').all() as Array<{ key: string; value: string }>;
+    const map: Record<string, string> = {};
+    for (const r of rows) map[r.key] = r.value;
+    return {
+        description: map['source_description'] ?? null,
+        published_date: map['published_date'] ?? null,
+        last_patch_date: map['last_patch_date'] ?? null,
+        imported_at: map['imported_at'] ?? null,
+    };
+}
+
+function formatFrequency(hz: number): string {
+    if (hz < 1_000) return `${hz} Hz`;
+    if (hz < 1_000_000) return `${(hz / 1_000).toFixed(3)} kHz`;
+    if (hz < 1_000_000_000) return `${(hz / 1_000_000).toFixed(3)} MHz`;
+    return `${(hz / 1_000_000_000).toFixed(3)} GHz`;
+}
+
 /**
  * Apply a hand-written SQL patch file (typically UPDATEs / INSERTs / DELETEs
  * derived from an ACMA legislative amendment). Trusted input — the curator
