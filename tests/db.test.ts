@@ -162,3 +162,56 @@ describe('T4 tables', () => {
         expect(row?.name).toBe('applic_text_block_fts');
     });
 });
+
+describe('Spectrum-plan tables', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_spectrum_ddl');
+    const dbPath = path.join(scratchDir, 'test_acma.db');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        initializeDatabase(dbPath);
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test.each([
+        'spectrum_allocations',
+        'spectrum_australian_footnotes',
+        'spectrum_international_footnotes',
+        'spectrum_plan_meta',
+    ])('creates table %s', (tableName) => {
+        const db = new Database(dbPath);
+        try {
+            const row = db.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+            ).get(tableName);
+            expect(row).toBeDefined();
+        } finally { db.close(); }
+    });
+
+    test('spectrum_allocations has the expected columns', () => {
+        const db = new Database(dbPath);
+        try {
+            const cols = (db.prepare('PRAGMA table_info(spectrum_allocations)').all() as any[])
+                .map(r => r.name);
+            expect(cols).toEqual(expect.arrayContaining([
+                'freq_start_hz', 'freq_end_hz', 'frequency_range', 'unit',
+                'region1', 'region2', 'region3',
+                'australian_table_of_allocations', 'common', 'footnote_ref',
+            ]));
+        } finally { db.close(); }
+    });
+
+    test('spectrum_allocations has the range index', () => {
+        const db = new Database(dbPath);
+        try {
+            const idx = db.prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name=?"
+            ).get('idx_spectrum_allocations_range');
+            expect(idx).toBeDefined();
+        } finally { db.close(); }
+    });
+});

@@ -239,6 +239,58 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
       );
     `
   },
+  "spectrum_allocations": {
+    "ddl": `
+      CREATE TABLE IF NOT EXISTS spectrum_allocations(
+        freq_start_hz INTEGER,
+        freq_end_hz INTEGER,
+        frequency_range TEXT,
+        unit TEXT,
+        region1 TEXT,
+        region2 TEXT,
+        region3 TEXT,
+        australian_table_of_allocations TEXT,
+        common TEXT,
+        footnote_ref TEXT
+      );
+    `,
+    "post_load_ddl": `
+      CREATE INDEX IF NOT EXISTS idx_spectrum_allocations_range
+        ON spectrum_allocations(freq_start_hz, freq_end_hz);
+    `
+  },
+  "spectrum_australian_footnotes": {
+    "ddl": `
+      CREATE TABLE IF NOT EXISTS spectrum_australian_footnotes(
+        footnote_ref TEXT,
+        footnote_text TEXT
+      );
+    `,
+    "post_load_ddl": `
+      CREATE INDEX IF NOT EXISTS idx_spectrum_au_fn_ref
+        ON spectrum_australian_footnotes(footnote_ref);
+    `
+  },
+  "spectrum_international_footnotes": {
+    "ddl": `
+      CREATE TABLE IF NOT EXISTS spectrum_international_footnotes(
+        footnote_ref TEXT,
+        footnote_text TEXT
+      );
+    `,
+    "post_load_ddl": `
+      CREATE INDEX IF NOT EXISTS idx_spectrum_intl_fn_ref
+        ON spectrum_international_footnotes(footnote_ref);
+    `
+  },
+  "spectrum_plan_meta": {
+    "ddl": `
+      CREATE TABLE IF NOT EXISTS spectrum_plan_meta(
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
+    `
+  },
   "meta": {
     "ddl": `
       CREATE TABLE IF NOT EXISTS meta(
