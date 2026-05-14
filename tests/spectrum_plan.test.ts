@@ -83,3 +83,108 @@ describe('parseFrequencyRange', () => {
         });
     });
 });
+
+import { applyReseed } from '../src/spectrum_plan';
+import { initializeDatabase } from '../src/db';
+import Database from 'better-sqlite3';
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+describe('applyReseed', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_spectrum_reseed');
+    const dbPath = path.join(scratchDir, 'test.db');
+    const sqlPath = path.join(scratchDir, 'seed.sql');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        initializeDatabase(dbPath);
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('applies a .sql dump to populate spectrum tables', () => {
+        const seed = `
+BEGIN TRANSACTION;
+INSERT INTO spectrum_allocations VALUES(87000000, 88000000, '87-88', 'MHz', 'BROADCASTING', 'BROADCASTING', 'BROADCASTING', 'BROADCASTING', 'FM broadcast band', '5.87 AUS37');
+INSERT INTO spectrum_australian_footnotes VALUES('AUS37', 'AUS37 footnote body.');
+INSERT INTO spectrum_international_footnotes VALUES('5.87', '5.87 ITU footnote body.');
+INSERT INTO spectrum_plan_meta VALUES('source_description', 'Test fixture');
+INSERT INTO spectrum_plan_meta VALUES('published_date', '2018-01-01');
+COMMIT;
+        `.trim();
+        fs.writeFileSync(sqlPath, seed);
+
+        const db = new Database(dbPath);
+        try {
+            applyReseed(db, sqlPath);
+            const allocCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as any).n;
+            const auCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_australian_footnotes').get() as any).n;
+            const intlCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_international_footnotes').get() as any).n;
+            expect(allocCount).toBe(1);
+            expect(auCount).toBe(1);
+            expect(intlCount).toBe(1);
+
+            const published = (db.prepare("SELECT value FROM spectrum_plan_meta WHERE key='published_date'").get() as any).value;
+            expect(published).toBe('2018-01-01');
+
+            const importedAt = (db.prepare("SELECT value FROM spectrum_plan_meta WHERE key='imported_at'").get() as any).value;
+            expect(importedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+        } finally { db.close(); }
+    });
+
+    test('re-applying a seed is idempotent (DELETEs first)', () => {
+        const seed = `
+BEGIN TRANSACTION;
+INSERT INTO spectrum_allocations VALUES(87000000, 88000000, '87-88', 'MHz', '', '', 'BROADCASTING', '', '', '');
+COMMIT;
+        `.trim();
+        fs.writeFileSync(sqlPath, seed);
+
+        const db = new Database(dbPath);
+        try {
+            applyReseed(db, sqlPath);
+            applyReseed(db, sqlPath);
+            const n = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as any).n;
+            expect(n).toBe(1);  // not 2
+        } finally { db.close(); }
+    });
+
+    test('applies a .db source with range parsing', () => {
+        // Build a synthetic source .db that mimics the pre-built frequency_allocations.db schema
+        const sourceDbPath = path.join(scratchDir, 'source.db');
+        if (fs.existsSync(sourceDbPath)) fs.unlinkSync(sourceDbPath);
+        const sdb = new Database(sourceDbPath);
+        sdb.exec(`
+            CREATE TABLE allocations(
+                frequency_range TEXT, unit TEXT,
+                region1 TEXT, region2 TEXT, region3 TEXT,
+                australian_table_of_allocations TEXT, common TEXT, footnote_ref TEXT
+            );
+            CREATE TABLE australian_footnotes(footnote_ref TEXT, footnote_text TEXT);
+            CREATE TABLE international_footnotes(footnote_ref TEXT, footnote_text TEXT);
+            INSERT INTO allocations VALUES('87-88', 'MHz', '', '', 'BROADCASTING', 'BROADCASTING', 'FM broadcast band', '5.87 AUS37');
+            INSERT INTO australian_footnotes VALUES('AUS37', 'AU body');
+            INSERT INTO international_footnotes VALUES('5.87', '5.87 body');
+        `);
+        sdb.close();
+
+        const db = new Database(dbPath);
+        try {
+            applyReseed(db, sourceDbPath);
+            const row = db.prepare('SELECT * FROM spectrum_allocations').get() as any;
+            expect(row.freq_start_hz).toBe(87_000_000);
+            expect(row.freq_end_hz).toBe(88_000_000);
+            expect(row.region3).toBe('BROADCASTING');
+
+            const auCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_australian_footnotes').get() as any).n;
+            expect(auCount).toBe(1);
+        } finally { db.close(); }
+    });
+});
