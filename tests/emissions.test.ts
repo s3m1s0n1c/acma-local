@@ -1,4 +1,3 @@
-import { jest } from '@jest/globals';
 import { parseEmissionBandwidth } from '../src/emissions.js';
 
 describe('parseEmissionBandwidth', () => {

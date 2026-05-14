@@ -3,7 +3,7 @@
  *
  * Designator shape: 4-char bandwidth + 3-char body (modulation/signal/info) +
  * optional 2-char tail (signal-detail + multiplex). Examples:
- *   16K0F3E    → 16 kHz, FM, single-channel analogue, telephony
+ *   16K0F3E    → 16.0 kHz, FM, single-channel analogue, telephony
  *   19M8W7DEW  → 19.8 MHz, combined-mode, multi-channel digital, data,
  *                multi-condition signal element, FDM+TDM
  *
@@ -48,8 +48,8 @@ export const CODE_TABLES = {
     },
     info_type: {
         N: { description: 'No information transmitted' },
-        A: { description: 'Telegraphy - aural reception' },
-        B: { description: 'Telegraphy - automatic reception' },
+        A: { description: 'Telegraphy — aural reception' },
+        B: { description: 'Telegraphy — automatic reception' },
         C: { description: 'Facsimile' },
         D: { description: 'Data transmission, telemetry, telecommand' },
         E: { description: 'Telephony (including sound broadcasting)' },
