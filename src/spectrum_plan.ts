@@ -31,7 +31,11 @@ const TOP_OF_SPECTRUM_HZ = 3_000_000_000_000;  // 3 THz sentinel for open-ended 
  * inside the range string is stripped before parsing.
  */
 export function parseFrequencyRange(rangeText: string, unit: string): { freq_start_hz: number; freq_end_hz: number } {
-    const multiplier = UNIT_MULTIPLIER[unit];
+    // Normalise to canonical mixed-case key (e.g. "KHZ" → "kHz", "MHZ" → "MHz").
+    const canonicalUnit = Object.keys(UNIT_MULTIPLIER).find(
+        k => k.toLowerCase() === unit.toLowerCase()
+    ) ?? unit;
+    const multiplier = UNIT_MULTIPLIER[canonicalUnit];
     if (multiplier === undefined) {
         throw new Error(`parseFrequencyRange: unknown unit "${unit}"`);
     }
@@ -223,11 +227,12 @@ function copyFromSourceDb(db: BetterSqlite3Database, sourcePath: string): void {
                 );
             }
 
-            const auRows = src.prepare('SELECT footnote_ref, footnote_text FROM australian_footnotes').all() as any[];
+            // Source DB uses columns `ref` and `text` (not footnote_ref/footnote_text).
+            const auRows = src.prepare('SELECT ref AS footnote_ref, text AS footnote_text FROM australian_footnotes').all() as any[];
             const insertAu = db.prepare('INSERT INTO spectrum_australian_footnotes(footnote_ref, footnote_text) VALUES(?, ?)');
             for (const r of auRows) insertAu.run(r.footnote_ref, r.footnote_text);
 
-            const intlRows = src.prepare('SELECT footnote_ref, footnote_text FROM international_footnotes').all() as any[];
+            const intlRows = src.prepare('SELECT ref AS footnote_ref, text AS footnote_text FROM international_footnotes').all() as any[];
             const insertIntl = db.prepare('INSERT INTO spectrum_international_footnotes(footnote_ref, footnote_text) VALUES(?, ?)');
             for (const r of intlRows) insertIntl.run(r.footnote_ref, r.footnote_text);
         })();
