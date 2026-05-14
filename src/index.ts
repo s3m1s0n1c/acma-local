@@ -6,7 +6,7 @@
  *                    get_licence_details, get_site_details, sync_data,
  *                    execute_sql, list_sample_queries, export_kml,
  *                    search_bsl, search_spectrum_band, search_application_text,
- *                    describe_schema, describe_tool.
+ *                    describe_schema, describe_tool, explain_query.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -28,7 +28,7 @@ import {
     searchSpectrumBand,
     searchApplicationText,
 } from './logic.js';
-import { executeSqlWithTimeout, listSampleQueries, describeSchema } from './sql.js';
+import { executeSqlWithTimeout, listSampleQueries, describeSchema, explainQuery } from './sql.js';
 import { generateKml } from './kml.js';
 
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
@@ -259,6 +259,21 @@ Returns the verbose, full-markdown documentation for any tool advertised by this
 ## Input
 - name: Exact tool name (case-sensitive)`,
     },
+    explain_query: {
+        summary: '[SQL] Returns SQLite EXPLAIN QUERY PLAN output for a SELECT/WITH statement.',
+        tags: ['sql', 'meta'],
+        fullDescription: `
+### [Query Plan Explainer]
+Returns SQLite's EXPLAIN QUERY PLAN output for a read-only query.
+
+## Usage
+- Pass a SELECT or WITH ... SELECT statement
+- Returns plan rows with { id, parent, notused, detail }
+- Use to understand index choices, scan vs lookup, join order
+
+## Input
+- sql: A SELECT or WITH ... SELECT statement (same restrictions as execute_sql)`,
+    },
 };
 
 // ─── Result Cache ────────────────────────────────────────────────────────────
@@ -455,6 +470,17 @@ function createServer(): Server {
                             description: 'Optional list of table names (case-insensitive); omit for all.',
                         },
                     },
+                },
+            },
+            {
+                name: 'explain_query',
+                description: TOOL_DOCS.explain_query!.summary,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        sql: { type: 'string', description: 'A SELECT or WITH ... SELECT statement' },
+                    },
+                    required: ['sql'],
                 },
             },
             {
@@ -730,6 +756,14 @@ function createServer(): Server {
             return { content: [{ type: 'text', text: doc.fullDescription.trim() }] };
         }
 
+        if (name === 'explain_query') {
+            const db = openDb();
+            try {
+                const plan = explainQuery(db, args?.sql as string);
+                return { content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }] };
+            } finally { db.close(); }
+        }
+
         if (name === 'execute_sql') {
             const sql = args?.sql as string;
             const limit = (args?.limit as number) ?? 100;
@@ -852,7 +886,7 @@ async function main() {
     const port = Number(PORT);
     app.listen(port, '0.0.0.0', () => {
         console.error(`ACMA RRL MCP Server v1.6.0 running on port ${port} at http://localhost:${port}/mcp`);
-        console.error('Tools: search_licences, get_licence_details, search_sites, get_site_details, search_clients, sync_data, execute_sql, list_sample_queries, export_kml, search_bsl, search_spectrum_band, search_application_text, describe_schema, describe_tool');
+        console.error('Tools: search_licences, get_licence_details, search_sites, get_site_details, search_clients, sync_data, execute_sql, list_sample_queries, export_kml, search_bsl, search_spectrum_band, search_application_text, describe_schema, describe_tool, explain_query');
     });
 }
 

@@ -195,14 +195,15 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         await transport.close();
     }, 15000);
 
-    test('tools/list includes describe_tool as the 14th tool', async () => {
+    test('tools/list includes explain_query as the 15th tool', async () => {
         const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
         const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
         await client.connect(transport);
 
         const tools = await client.listTools();
         expect(tools.tools.some(t => t.name === 'describe_tool')).toBe(true);
-        expect(tools.tools.length).toBe(14);
+        expect(tools.tools.some(t => t.name === 'explain_query')).toBe(true);
+        expect(tools.tools.length).toBe(15);
 
         await transport.close();
     }, 15000);
@@ -259,7 +260,7 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
             'search_licences', 'get_licence_details', 'search_sites', 'get_site_details',
             'search_clients', 'search_bsl', 'search_spectrum_band', 'search_application_text',
             'sync_data', 'list_sample_queries', 'execute_sql', 'export_kml',
-            'describe_schema', 'describe_tool',
+            'describe_schema', 'describe_tool', 'explain_query',
         ];
         for (const name of advertised) {
             expect(TOOL_DOCS[name]).toBeDefined();

@@ -131,6 +131,33 @@ export function describeSchema(
     });
 }
 
+export interface QueryPlanRow {
+    id: number;
+    parent: number;
+    notused: number;
+    detail: string;
+}
+
+/**
+ * Returns SQLite's EXPLAIN QUERY PLAN output for a SELECT/WITH statement.
+ * Reuses the executeSql validator: only SELECT/WITH is accepted; INSERT/UPDATE/
+ * DELETE/DROP are rejected with the same error message.
+ */
+export function explainQuery(db: Database.Database, sql: string): QueryPlanRow[] {
+    const trimmed = sql.trim();
+    if (!trimmed) {
+        throw new Error('SQL query cannot be empty.');
+    }
+    const firstWord = (trimmed.split(/\s+/)[0] ?? '').toUpperCase();
+    if (firstWord !== 'SELECT' && firstWord !== 'WITH') {
+        throw new Error(
+            `Only SELECT/WITH statements are allowed. Received: ${firstWord}. ` +
+            `Use execute_sql for read-only queries only.`
+        );
+    }
+    return db.prepare(`EXPLAIN QUERY PLAN ${trimmed}`).all() as QueryPlanRow[];
+}
+
 export type SampleQueryCategory =
     | 'lookup'
     | 'statistics'

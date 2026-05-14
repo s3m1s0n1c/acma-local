@@ -1,4 +1,4 @@
-import { executeSql, listSampleQueries, executeSqlWithTimeout, describeSchema } from '../src/sql.js';
+import { executeSql, listSampleQueries, executeSqlWithTimeout, describeSchema, explainQuery } from '../src/sql.js';
 import { initializeDatabase } from '../src/db.js';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -267,6 +267,37 @@ describe('describeSchema', () => {
         db.close();
         expect(result).toHaveLength(1);
         expect(result[0]!.isVirtual).toBe(true);
+    });
+});
+
+describe('explainQuery', () => {
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir_p2)) fs.mkdirSync(scratchDir_p2);
+        if (fs.existsSync(dbPath_p2)) fs.unlinkSync(dbPath_p2);
+        initializeDatabase(dbPath_p2);
+    });
+
+    test('explainQuery returns plan rows for a SELECT', () => {
+        const db = new Database(dbPath_p2);
+        const plan = explainQuery(db, 'SELECT * FROM client WHERE CLIENT_NO = 42');
+        db.close();
+        expect(Array.isArray(plan)).toBe(true);
+        expect(plan.length).toBeGreaterThan(0);
+        const joined = plan.map(r => r.detail).join(' ');
+        expect(joined.toLowerCase()).toContain('client');
+    });
+
+    test('explainQuery accepts WITH/CTE input', () => {
+        const db = new Database(dbPath_p2);
+        const plan = explainQuery(db, 'WITH x AS (SELECT 1) SELECT * FROM x');
+        db.close();
+        expect(plan.length).toBeGreaterThan(0);
+    });
+
+    test('explainQuery rejects mutating SQL', () => {
+        const db = new Database(dbPath_p2);
+        expect(() => explainQuery(db, 'INSERT INTO client (CLIENT_NO) VALUES (1)')).toThrow(/Only SELECT.WITH/);
+        db.close();
     });
 });
 
