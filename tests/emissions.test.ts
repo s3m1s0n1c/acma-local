@@ -100,7 +100,7 @@ describe('decodeEmissionDesignator', () => {
         const d = decodeEmissionDesignator('10K1F3EZN');
         expect(d.valid).toBe(true);
         expect(d.signal_detail).toBeNull();
-        expect(d.warnings.some(w => /signal.detail/i.test(w))).toBe(true);
+        expect(d.warnings.some(w => /signal-detail/i.test(w))).toBe(true);
     });
 
     test('empty string — invalid, no fields set', () => {
@@ -129,5 +129,13 @@ describe('decodeEmissionDesignator', () => {
         expect(d.valid).toBe(true);
         expect(d.modulation?.code).toBe('C');
         expect(d.info_type?.code).toBe('F');
+    });
+
+    test('0K00F3E — bandwidth first-char-zero, early exit, body not attempted', () => {
+        const d = decodeEmissionDesignator('0K00F3E');
+        expect(d.valid).toBe(false);
+        expect(d.bandwidth).toBeNull();
+        expect(d.modulation).toBeNull();
+        expect(d.warnings.some(w => /bandwidth/i.test(w))).toBe(true);
     });
 });

@@ -82,7 +82,13 @@ export const CODE_TABLES = {
         W: { description: 'Combination of frequency-division and time-division multiplex' },
         X: { description: 'Other types of multiplexing' },
     },
-} as const;
+} as const satisfies {
+    modulation: Record<string, { description: string; group: string }>;
+    signal_nature: Record<string, { description: string }>;
+    info_type: Record<string, { description: string }>;
+    signal_detail: Record<string, { description: string }>;
+    multiplex: Record<string, { description: string }>;
+};
 
 export type EmissionField = keyof typeof CODE_TABLES;
 
@@ -199,7 +205,7 @@ export function decodeEmissionDesignator(input: string): DecodedEmission {
         bandwidth = { ...parsed, raw: bwRaw };
     } catch (e) {
         warnings.push(`Bandwidth parse failed: ${(e as Error).message}`);
-        return { ...empty, warnings };
+        return empty;
     }
 
     // Required body (positions 4, 5, 6).
