@@ -24,6 +24,7 @@ import {
     getSiteDetails,
     searchBsl,
     searchSpectrumBand,
+    searchApplicationText,
 } from './logic.js';
 import { executeSqlWithTimeout, listSampleQueries } from './sql.js';
 import { generateKml } from './kml.js';
@@ -235,6 +236,28 @@ Find licences authorised in a frequency range. Frequencies are in Hertz (Hz).
                 },
             },
             {
+                name: 'search_application_text',
+                description: `
+### [Licence Application Text Search]
+Full-text search across licence application narrative (conditions, exemptions, special clauses).
+
+## Usage
+- Pass an FTS5 query string. Supports: phrase ("text in quotes"), AND/OR, NEAR/N, prefix*.
+- Results return APTB_ID, LICENCE_NO, APTB_CATEGORY, APTB_DESCRIPTION, a snippet with «match» markers, and a BM25 rank score (lower is better).
+- For full text of a matching APTB_ID, follow up with execute_sql: SELECT APTB_TEXT FROM applic_text_block WHERE APTB_ID = ...
+
+## Input
+- query: FTS5 query (e.g. 'aeronautical', '"marine emergency"', 'ICAO OR ITU')`,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        query: { type: 'string', description: 'FTS5 query string' },
+                        limit: { type: 'number', description: 'Max rows (default 20)' },
+                    },
+                    required: ['query'],
+                },
+            },
+            {
                 name: 'sync_data',
                 description: `
 ### [Data Synchronization]
@@ -441,6 +464,18 @@ Generate a KML file from cached query results.
                     db,
                     args?.freq_min_hz as number,
                     args?.freq_max_hz as number,
+                    (args?.limit as number) ?? 20
+                );
+                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+            } finally { db.close(); }
+        }
+
+        if (name === 'search_application_text') {
+            const db = openDb();
+            try {
+                const results = searchApplicationText(
+                    db,
+                    args?.query as string,
                     (args?.limit as number) ?? 20
                 );
                 return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };

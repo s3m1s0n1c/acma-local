@@ -125,6 +125,23 @@ export function searchSpectrumBand(
   `).all(freqMinHz, freqMaxHz, freqMinHz, freqMaxHz, limit);
 }
 
+export function searchApplicationText(
+  db: Database.Database,
+  ftsQuery: string,
+  limit: number = 20
+) {
+  return db.prepare(`
+    SELECT atb.APTB_ID, atb.LICENCE_NO, atb.APTB_CATEGORY, atb.APTB_DESCRIPTION,
+           snippet(applic_text_block_fts, 0, '«', '»', '…', 32) AS snippet,
+           bm25(applic_text_block_fts) AS rank
+    FROM applic_text_block_fts
+    JOIN applic_text_block atb ON atb.APTB_ID = applic_text_block_fts.rowid
+    WHERE applic_text_block_fts MATCH ?
+    ORDER BY rank
+    LIMIT ?
+  `).all(ftsQuery, limit);
+}
+
 export function getLicenceDetails(db: Database.Database, licenceNo: string) {
   const licence = db.prepare(`
     ${LICENCE_SELECT}

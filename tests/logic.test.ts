@@ -6,6 +6,7 @@ import {
     getLicenceDetails,
     searchBsl,
     searchSpectrumBand,
+    searchApplicationText,
 } from '../src/logic.js';
 import { initializeDatabase } from '../src/db.js';
 import Database from 'better-sqlite3';
@@ -232,5 +233,24 @@ describe('Logic Layer', () => {
 
         expect(lwHit.map(r => r.LICENCE_NO)).toContain('LW_ONLY');
         expect(upMiss.map(r => r.LICENCE_NO)).not.toContain('LW_ONLY');
+    });
+
+    test('searchApplicationText returns matching rows with snippets and BM25 ordering', () => {
+        const db = new Database(dbPath);
+        db.exec(`
+            INSERT INTO applic_text_block (APTB_ID, LICENCE_NO, APTB_CATEGORY, APTB_DESCRIPTION, APTB_TEXT)
+                VALUES (100, 'L100', 'SPCOND', 'Aviation conditions', 'Operation in aeronautical bands subject to ICAO standards.');
+            INSERT INTO applic_text_block (APTB_ID, LICENCE_NO, APTB_CATEGORY, APTB_DESCRIPTION, APTB_TEXT)
+                VALUES (101, 'L101', 'SPCOND', 'Marine conditions', 'Operation must comply with marine emergency procedures.');
+            INSERT INTO applic_text_block_fts(applic_text_block_fts) VALUES('rebuild');
+        `);
+        db.close();
+
+        const db2 = new Database(dbPath, { readonly: true });
+        const results = searchApplicationText(db2, 'marine', 5) as any[];
+        db2.close();
+        expect(results).toHaveLength(1);
+        expect(results[0]).toMatchObject({ APTB_ID: 101, LICENCE_NO: 'L101' });
+        expect(results[0].snippet).toContain('«marine»');
     });
 });
