@@ -6,7 +6,9 @@ import { parse } from 'csv-parse';
 import { parse as parseCsvSync } from 'csv-parse/sync';
 import axios from 'axios';
 import { pipeline } from 'stream/promises';
+import { fileURLToPath } from 'url';
 import { initializeDatabase, TABLE_METADATA } from './db.js';
+import { bootstrapSpectrumPlan } from './spectrum_plan.js';
 
 export interface SyncConfig {
     extractsUrl: string;
@@ -485,6 +487,18 @@ export async function performFullSync(config: SyncConfig, fullEntry: ExtractEntr
             anDb.exec('ANALYZE;');
         } finally {
             anDb.close();
+        }
+
+        // Auto-bootstrap spectrum plan tables if empty (e.g. fresh DB after wipe).
+        // Seed lives at <project_root>/seed/spectrum_plan.sql. Resolve via __dirname
+        // so it works regardless of where the runtime DB lives.
+        const seedDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'seed');
+        const seedPath = path.join(seedDir, 'spectrum_plan.sql');
+        const bsDb = new Database(config.dbPath);
+        try {
+            bootstrapSpectrumPlan(bsDb, seedPath);
+        } finally {
+            bsDb.close();
         }
 
         const db = new Database(config.dbPath);

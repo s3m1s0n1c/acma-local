@@ -242,6 +242,31 @@ function copyFromSourceDb(db: BetterSqlite3Database, sourcePath: string): void {
 }
 
 /**
+ * Auto-bootstrap helper: if spectrum_allocations is empty AND the seed file
+ * exists at the given path, apply it. Used at the tail of performFullSync so
+ * that "delete acma.db and rebuild" produces a complete schema.
+ *
+ * Failure modes are non-fatal — a missing/malformed seed logs a warning and
+ * leaves spectrum tables empty (the MCP server still runs without them).
+ */
+export function bootstrapSpectrumPlan(db: BetterSqlite3Database, seedPath: string): void {
+    const n = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+    if (n > 0) {
+        return;
+    }
+    if (!fs.existsSync(seedPath)) {
+        console.error(`[SPECTRUM] Bootstrap skipped: no seed at ${seedPath}`);
+        return;
+    }
+    try {
+        console.error(`[SPECTRUM] Bootstrapping spectrum tables from ${seedPath}`);
+        applyReseed(db, seedPath);
+    } catch (e) {
+        console.error(`[SPECTRUM] Bootstrap failed: ${(e as Error).message}. Spectrum tables remain empty.`);
+    }
+}
+
+/**
  * Apply a hand-written SQL patch file (typically UPDATEs / INSERTs / DELETEs
  * derived from an ACMA legislative amendment). Trusted input — the curator
  * wrote it. Records last_patch_date in spectrum_plan_meta.

@@ -338,6 +338,62 @@ COMMIT;
     });
 });
 
+import { bootstrapSpectrumPlan } from '../src/spectrum_plan';
+
+describe('bootstrapSpectrumPlan', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_spectrum_bootstrap');
+    const dbPath = path.join(scratchDir, 'test.db');
+    const seedPath = path.join(scratchDir, 'seed.sql');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        if (fs.existsSync(seedPath)) fs.unlinkSync(seedPath);
+        initializeDatabase(dbPath);
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('populates empty spectrum tables from seed', () => {
+        fs.writeFileSync(seedPath, `
+BEGIN TRANSACTION;
+INSERT INTO spectrum_allocations VALUES(87000000, 88000000, '87-88', 'MHz', '', '', 'BROADCASTING', '', '', '');
+COMMIT;
+        `.trim());
+
+        const db = new Database(dbPath);
+        try {
+            bootstrapSpectrumPlan(db, seedPath);
+            const n = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+            expect(n).toBe(1);
+        } finally { db.close(); }
+    });
+
+    test('no-op when spectrum tables already populated', () => {
+        const db = new Database(dbPath);
+        db.exec("INSERT INTO spectrum_allocations VALUES(1, 2, 'a', 'Hz', '', '', '', '', '', '');");
+        // Write a seed that would *replace* the row if applyReseed ran:
+        fs.writeFileSync(seedPath, "BEGIN TRANSACTION; INSERT INTO spectrum_allocations VALUES(99,100,'b','Hz','','','','','',''); COMMIT;");
+        try {
+            bootstrapSpectrumPlan(db, seedPath);
+            const rows = db.prepare('SELECT * FROM spectrum_allocations').all() as any[];
+            expect(rows).toHaveLength(1);
+            expect(rows[0].freq_start_hz).toBe(1);  // original row preserved
+        } finally { db.close(); }
+    });
+
+    test('no-op (no throw) when seed file is missing', () => {
+        const db = new Database(dbPath);
+        try {
+            expect(() => bootstrapSpectrumPlan(db, '/nonexistent/seed.sql')).not.toThrow();
+            const n = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+            expect(n).toBe(0);
+        } finally { db.close(); }
+    });
+});
+
 describe('applyPatch', () => {
     const scratchDir = path.join(__dirname, '../scratch_test_spectrum_patch');
     const dbPath = path.join(scratchDir, 'test.db');
