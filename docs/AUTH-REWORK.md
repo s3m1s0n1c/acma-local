@@ -11,6 +11,65 @@ Reference document covering the four orthogonal pieces of work required to harde
 
 ---
 
+## Threat model
+
+This section describes the SQL data-integrity posture an MCP client has against the server, independent of network controls. Everything below assumes the client can already reach `/mcp` — once a network-exposure deployment is in scope, the controls in §§1–4 below sit *in front of* this surface.
+
+### SQL-write attack surface: `execute_sql`
+
+The `execute_sql` tool is the primary attack surface for mutation attempts. Five orthogonal defenses are in place in `src/sql_worker.cjs`; any one of them is sufficient to block injection:
+
+| # | Defense | Implementation | Blocks |
+|---|---|---|---|
+| 1 | First-word validator | `sql_worker.cjs:19-25` — rejects everything except `SELECT` and `WITH` | direct `INSERT` / `UPDATE` / `DELETE` / `DROP` / `PRAGMA` / `ATTACH` / `VACUUM` / `REINDEX` |
+| 2 | LIMIT-wrap | `sql_worker.cjs:28` — wraps query as `SELECT * FROM (${trimmed}) LIMIT N` | `WITH x AS (SELECT 1) DELETE FROM t` style CTE-mutation. DELETE/UPDATE/INSERT are not valid subqueries; SQLite's parser rejects the wrapped form |
+| 3 | Semicolon ban | `sql_worker.cjs:40-42` — rejects wrapped query if it contains `;` | multi-statement injection (`SELECT 1; DROP TABLE x`) |
+| 4 | Worker-thread isolation | `sql.ts:380` — query runs in a separate thread with its own DB handle | a successful exploit cannot directly observe main-thread state |
+| 5 | Transaction-rollback sandbox | `sql_worker.cjs:45-58` — wraps everything in `BEGIN TRANSACTION; … ROLLBACK;` | belt-and-suspenders: any write reaching the executor is discarded on rollback |
+
+A 25-second timeout in `executeSqlWithTimeout` (`sql.ts:385`) terminates the worker if it doesn't respond, capping CPU exposure per request.
+
+### `explain_query`
+
+Uses the same first-word validator (`sql.ts:151-157`), then prefixes the input with `EXPLAIN QUERY PLAN`. `EXPLAIN QUERY PLAN` is a planner-output-only operation — SQLite never executes the underlying statement, only reports the strategy it would choose. `better-sqlite3`'s `prepare()` also rejects multi-statement input at parse time, so `;`-injection fails before any execution.
+
+### `describe_schema`
+
+The user-supplied `tables[]` argument is filtered against an allowlist drawn from `sqlite_master` (`sql.ts:87-91`) before any string interpolation. The subsequent `PRAGMA table_info(${name})` / `PRAGMA index_list(${name})` / `PRAGMA index_info(${i.name})` calls receive names that already exist in the schema; no user-provided string reaches the interpolated position.
+
+### `search_*` and `get_*` tools
+
+All other MCP tools that take user input (`search_licences`, `search_sites`, `search_clients`, `search_bsl`, `search_spectrum_band`, `search_application_text`, `get_licence_details`, `get_site_details`, `get_frequency_allocation`) use `?` parameter binding throughout `src/logic.ts` and the dispatcher in `src/index.ts`. No string-interpolation of MCP input into SQL.
+
+### Template-interpolation audit
+
+`grep -nE 'db\.prepare\(`[^`]*\$\{[^}]+\}[^`]*`\)' src/*.ts` returns ten matches across `src/sql.ts`, `src/sync.ts`, and `src/spectrum_plan.ts`. Every one of them interpolates either:
+
+- a hardcoded module-level constant (e.g. `SPECTRUM_TABLES`), or
+- a name read from `sqlite_master` server-side, or
+- a value derived from filenames during ACMA-side sync (`src/sync.ts`, not reachable from MCP).
+
+No template-interpolated `db.prepare()` carries MCP user input.
+
+### Capabilities available to any MCP client
+
+The following are operational properties of the tool surface, not vulnerabilities, and are documented here so they aren't mistaken for either:
+
+- **Full read access to materialised rows** through `execute_sql`.
+- **Schema enumeration** through `describe_schema` or `SELECT … FROM sqlite_master` via `execute_sql`.
+- **Bounded denial-of-service via expensive queries.** Pathological `WITH RECURSIVE` or unbounded cross-joins are capped by the 25-second timeout and 64 MB worker cache; while running, each occupies one worker thread. `sync_data` with `mode='full'` initiates a 70 MB download.
+
+None of these affect on-disk data integrity.
+
+### Trust boundaries outside MCP
+
+Two paths accept arbitrary database writes; neither is reachable from MCP:
+
+- **`npm run import-spectrum-plan -- --patch <path>`** runs the SQL contents of a hand-written patch file directly. Trust boundary: anyone with shell access on the host.
+- **`performFullSync`** writes every table from CSVs extracted out of `spectra_rrl.zip`. Trust boundary: ACMA's CDN plus Node's default TLS verification of the manifest and download.
+
+---
+
 ## 1. Bearer-token authentication
 
 Require an `Authorization: Bearer <token>` header on every `POST /mcp` request. `/health` remains open. A single shared secret rotated out of band is sufficient for the surface; JWT machinery is unnecessary and adds attack surface.
