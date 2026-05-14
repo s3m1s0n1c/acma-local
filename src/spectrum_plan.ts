@@ -235,3 +235,31 @@ function copyFromSourceDb(db: BetterSqlite3Database, sourcePath: string): void {
         if (src.open) src.close();
     }
 }
+
+/**
+ * Apply a hand-written SQL patch file (typically UPDATEs / INSERTs / DELETEs
+ * derived from an ACMA legislative amendment). Trusted input — the curator
+ * wrote it. Records last_patch_date in spectrum_plan_meta.
+ *
+ * Warns on >50% allocation loss as a sanity check for accidentally
+ * destructive patches.
+ */
+export function applyPatch(db: BetterSqlite3Database, patchPath: string): void {
+    if (!fs.existsSync(patchPath)) {
+        throw new Error(`applyPatch: patch file not found: ${patchPath}`);
+    }
+    const sql = fs.readFileSync(patchPath, 'utf-8');
+
+    const before = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+    db.exec(sql);
+    const after = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+
+    if (before > 0 && after < before / 2) {
+        console.error(`[SPECTRUM] WARNING: patch reduced allocations from ${before} to ${after} (>50% deletion).`);
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    db.prepare('INSERT OR REPLACE INTO spectrum_plan_meta(key, value) VALUES(?, ?)').run('last_patch_date', today);
+
+    console.error(`[SPECTRUM] Applied patch ${patchPath} (allocations ${before} -> ${after})`);
+}

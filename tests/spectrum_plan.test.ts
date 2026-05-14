@@ -1,4 +1,4 @@
-import { parseFrequencyRange } from '../src/spectrum_plan';
+import { parseFrequencyRange, applyPatch } from '../src/spectrum_plan';
 
 describe('parseFrequencyRange', () => {
     test('plain MHz range', () => {
@@ -335,5 +335,49 @@ COMMIT;
         const dumped = fs.readFileSync(out, 'utf-8');
         // NULL values must appear as the SQL token NULL, not 'NULL' (quoted)
         expect(dumped).toMatch(/NULL.*99.*'test'.*NULL/);
+    });
+});
+
+describe('applyPatch', () => {
+    const scratchDir = path.join(__dirname, '../scratch_test_spectrum_patch');
+    const dbPath = path.join(scratchDir, 'test.db');
+
+    beforeEach(() => {
+        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        initializeDatabase(dbPath);
+        const db = new Database(dbPath);
+        db.exec(`
+            INSERT INTO spectrum_australian_footnotes VALUES('AUS37', 'OLD text');
+            INSERT INTO spectrum_plan_meta VALUES('published_date', '2018-01-01');
+        `);
+        db.close();
+    });
+
+    afterAll(() => {
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+    });
+
+    test('applies UPDATE statement and records last_patch_date', () => {
+        const patchPath = path.join(scratchDir, 'patch.sql');
+        fs.writeFileSync(patchPath, "UPDATE spectrum_australian_footnotes SET footnote_text = 'NEW text' WHERE footnote_ref = 'AUS37';");
+
+        const db = new Database(dbPath);
+        try {
+            applyPatch(db, patchPath);
+
+            const row = db.prepare("SELECT footnote_text FROM spectrum_australian_footnotes WHERE footnote_ref='AUS37'").get() as { footnote_text: string };
+            expect(row.footnote_text).toBe('NEW text');
+
+            const lastPatch = (db.prepare("SELECT value FROM spectrum_plan_meta WHERE key='last_patch_date'").get() as { value: string }).value;
+            expect(lastPatch).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+        } finally { db.close(); }
+    });
+
+    test('throws on missing patch file', () => {
+        const db = new Database(dbPath);
+        try {
+            expect(() => applyPatch(db, path.join(scratchDir, 'nonexistent.sql'))).toThrow(/not found/i);
+        } finally { db.close(); }
     });
 });
