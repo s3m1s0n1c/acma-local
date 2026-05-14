@@ -75,8 +75,7 @@ export function describeSchema(
 ): TableDescription[] {
     const masterRows = db.prepare(
         `SELECT name, type, sql FROM sqlite_master
-         WHERE type IN ('table', 'virtual')
-            OR (type = 'table' AND sql IS NOT NULL)
+         WHERE type = 'table'
          ORDER BY name`
     ).all() as Array<{ name: string; type: string; sql: string | null }>;
 
