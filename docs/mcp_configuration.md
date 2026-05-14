@@ -67,7 +67,7 @@ When using either mode, the `sync_data` tool provides enhanced feedback:
 
 | Variable | Description |
 |----------|-------------|
-| `PORT` | Port for the HTTP/SSE server (Default: `3000`). |
-| `ACMA_DB_PATH` | Absolute path to the SQLite database. |
-| `DEBUG_NETWORK` | Set to `true` to log all network traffic. |
-| `DEBUG_AUTH` | Set to `true` to log auth stub authorizations. |
+| `PORT` | Port for the Streamable HTTP server (default `3000`). |
+| `ACMA_DB_PATH` | Absolute path to the SQLite database (default `./data/acma.db`). |
+| `LOG_LEVEL` | One of `error` / `warn` / `info` (default) / `debug`. Controls verbosity of in-process logging routed through `src/logger.ts`. |
+| `DEBUG_NETWORK` | Legacy alias — when set, promotes `LOG_LEVEL` to `debug`. |

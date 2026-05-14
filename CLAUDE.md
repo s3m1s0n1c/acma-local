@@ -88,4 +88,5 @@ Runtime introspection: call the `describe_schema` MCP tool (or `describeSchema()
 | `ACMA_DB_PATH` | Absolute path to the SQLite DB. Defaults to `./data/acma.db`. |
 | `LOG_LEVEL` | `error` / `warn` / `info` (default) / `debug`. Routed via `src/logger.ts`. |
 | `DEBUG_NETWORK` | Legacy alias — when set, promotes `LOG_LEVEL` to `debug`. Kept working for backwards compatibility. |
-| `DEBUG_AUTH` | `true` → log auth-stub authorizations (auth is currently a placeholder; see `docs/AUTH-REWORK.md`). |
+
+For network-exposure hardening (bearer auth, TLS, rate limiting, container packaging), see `docs/AUTH-REWORK.md`.

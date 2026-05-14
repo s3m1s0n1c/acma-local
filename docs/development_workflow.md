@@ -34,23 +34,26 @@ node dist/index.js
 
 ## Testing
 
-The project includes a comprehensive test suite covering the database, synchronization logic, and tool implementations.
-
-### Running All Tests
+The test suite is split into two scripts so the fast unit + non-network integration tests can run cheaply on every change without the overhead of spawning a real server:
 
 ```bash
-npm test
+npm test                # fast suite (excludes tests/network.test.ts)
+npm run test:integration  # network end-to-end suite only
+npm run test:all          # both
 ```
 
 ### Running Specific Tests
 
-- **Database Schema**: `npm test tests/db.test.ts`
-- **Synchronization Logic**: `npm test tests/sync.test.ts`
-- **Search Logic**: `npm test tests/logic.test.ts`
-- **Network & SSE**: `npm test tests/network.test.ts`
+Use `--` to forward arguments to Jest:
+
+- **Database schema**: `npm test -- tests/db.test.ts`
+- **Synchronization logic**: `npm test -- tests/sync.test.ts`
+- **Search logic**: `npm test -- tests/logic.test.ts`
+- **Network integration**: `npm run test:integration`
 
 ### Testing Network Mode
-The network tests (`tests/network.test.ts`) spawn a server instance on a specific port and use `SSEClientTransport` to verify end-to-end connectivity.
+
+`tests/network.test.ts` spawns a server instance on port `3001` and uses `StreamableHTTPClientTransport` from the MCP SDK to verify end-to-end connectivity, tool dispatch, and `_hints` payloads.
 
 ## Test Infrastructure
 
