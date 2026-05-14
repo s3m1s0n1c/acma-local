@@ -30,6 +30,7 @@ import {
 } from './logic.js';
 import { executeSqlWithTimeout, listSampleQueries, describeSchema, explainQuery } from './sql.js';
 import { generateKml } from './kml.js';
+import { lookupFrequencyAllocation } from './spectrum_plan.js';
 
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
 const PORT = process.env.PORT || 3000;
@@ -273,6 +274,30 @@ Returns SQLite's EXPLAIN QUERY PLAN output for a read-only query.
 
 ## Input
 - sql: A SELECT or WITH ... SELECT statement (same restrictions as execute_sql)`,
+    },
+    get_frequency_allocation: {
+        summary: 'Look up the Australian Radiofrequency Spectrum Plan allocation for a frequency in Hz. [spectrum]',
+        tags: ['lookup', 'spectrum'],
+        fullDescription: `
+### [Spectrum Allocation Lookup]
+Look up the Australian Radiofrequency Spectrum Plan (ARSP) allocation for a given frequency.
+
+## Usage
+- Provide a frequency in Hz (integer). Examples:
+  - 87100000 -> 87.1 MHz (FM broadcast band)
+  - 2400000000 -> 2.4 GHz (ISM band)
+  - 14000000 -> 14 MHz (amateur 20 m band)
+- Returns: matching allocation row(s) with ITU/AU table entries, joined footnotes, and source-provenance metadata.
+
+## Input
+- freq_hz: Frequency in Hz (positive integer).
+- include_footnotes: If true (default), full footnote text is included.
+
+## Notes
+- The base data is the ARSP 2018 baseline. The plan is updated by legislative amendment;
+  consult the current legislation for any licensing decision. The response includes a
+  _warning when the base is more than 3 years old.
+- Multiple matches usually indicate overlapping bands from a patched plan; check the warning.`,
     },
 };
 
@@ -521,6 +546,24 @@ function createServer(): Server {
                         name: { type: 'string', description: 'Exact tool name (case-sensitive)' },
                     },
                     required: ['name'],
+                },
+            },
+            {
+                name: 'get_frequency_allocation',
+                description: TOOL_DOCS.get_frequency_allocation!.summary,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        freq_hz: {
+                            type: 'number',
+                            description: 'Frequency in Hz. Examples: 87100000 (87.1 MHz), 2400000000 (2.4 GHz).',
+                        },
+                        include_footnotes: {
+                            type: 'boolean',
+                            description: 'If true (default), include full footnote text.',
+                        },
+                    },
+                    required: ['freq_hz'],
                 },
             },
         ],
@@ -816,6 +859,57 @@ function createServer(): Server {
             return {
                 content: [{ type: 'text', text: kml }]
             };
+        }
+
+        if (name === 'get_frequency_allocation') {
+            const freq_hz = args?.freq_hz as number;
+            const include_footnotes = args?.include_footnotes !== false;  // default true
+            if (typeof freq_hz !== 'number' || !Number.isFinite(freq_hz) || freq_hz <= 0) {
+                return { content: [{ type: 'text', text: JSON.stringify({ _error: 'freq_hz must be a positive number (Hz).' }, null, 2) }] };
+            }
+            const db = openDb();
+            try {
+                const tableCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+                if (tableCount === 0) {
+                    return { content: [{ type: 'text', text: JSON.stringify({ _error: "Spectrum plan data not loaded. Run 'npm run import-spectrum-plan -- --reseed'." }, null, 2) }] };
+                }
+                const result: any = lookupFrequencyAllocation(db, freq_hz, include_footnotes);
+
+                // Staleness warning
+                const warnings: string[] = [];
+                const publishedRaw = result.source.published_date;
+                if (publishedRaw) {
+                    const pub = new Date(publishedRaw);
+                    if (!Number.isNaN(pub.getTime())) {
+                        const ageMs = Date.now() - pub.getTime();
+                        const ageYears = ageMs / (1000 * 60 * 60 * 24 * 365.25);
+                        if (ageYears >= 3) {
+                            if (result.source.last_patch_date) {
+                                warnings.push(`Spectrum plan base from ${publishedRaw}; last patched ${result.source.last_patch_date}. Verify against the current legislation for licensing decisions.`);
+                            } else {
+                                warnings.push(`Spectrum plan base data is ${Math.floor(ageYears)} years old (published ${publishedRaw}); not patched. Verify against the current legislation for licensing decisions.`);
+                            }
+                        }
+                    }
+                }
+                if (result.match_count === 0) {
+                    warnings.push('No allocation found in the Australian Radiofrequency Spectrum Plan for this frequency.');
+                } else if (result.match_count > 1) {
+                    warnings.push(`${result.match_count} overlapping allocations matched; the plan should not contain overlaps - verify recent patches.`);
+                }
+                if (warnings.length > 0) {
+                    result._warning = warnings.join(' ');
+                }
+
+                if (result.match_count > 0) {
+                    result._hints = [
+                        { tool: 'search_licences', why: 'find licences operating in this band' },
+                        { tool: 'search_application_text', why: "search application text for this band's usage" },
+                    ];
+                }
+
+                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+            } finally { if (db.open) db.close(); }
         }
 
         return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
