@@ -293,17 +293,27 @@ Look up the Australian Radiofrequency Spectrum Plan (ARSP) allocation for a give
   - 87100000 -> 87.1 MHz (FM broadcast band)
   - 2400000000 -> 2.4 GHz (ISM band)
   - 14000000 -> 14 MHz (amateur 20 m band)
-- Returns: matching allocation row(s) with ITU/AU table entries, joined footnotes, and source-provenance metadata.
 
 ## Input
 - freq_hz: Frequency in Hz (positive integer).
-- include_footnotes: If true (default), full footnote text is included.
+- include_footnotes: If true (default), full footnote text is included in resolved_footnotes.
+
+## Response shape
+- allocation: The AU row covering the frequency (null if none).
+- match_count: Number of AU rows matched (normally 0 or 1; >1 indicates plan overlap).
+- regions: { 1, 2, 3 } — ITU Region contrast rows (null when no region row exists for that frequency).
+- resolved_footnotes: Flat map of footnote_ref → footnote_text for every ref in allocation + regions (omitted when include_footnotes is false).
+- source: { published_date, last_patch_date } — provenance from spectrum_plan_meta.
+
+Each allocation / region row contains:
+- services[]: { name, primary, inline_footnotes[], qualifier? }
+- footnotes[]: cell-level footnote refs (e.g. "AUS37", "5.87")
+- raw: the original table-cell text
+- region: present only on region rows (1, 2, or 3)
 
 ## Notes
-- The base data is the ARSP 2018 baseline. The plan is updated by legislative amendment;
-  consult the current legislation for any licensing decision. The response includes a
-  _warning when the base is more than 3 years old.
-- Multiple matches usually indicate overlapping bands from a patched plan; check the warning.`,
+- The plan is updated by legislative amendment; consult the current legislation for any licensing decision.
+- A _warning is added when the base data is more than 3 years old or when no match is found.`,
     },
     decode_emission_designator: {
         summary: 'Decode an ITU/ACA emission designator (e.g. 16K0F3E) into bandwidth, modulation, signal nature, info type and optional details. [reference]',

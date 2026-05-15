@@ -151,142 +151,130 @@ export function bootstrapSpectrumPlan(db: BetterSqlite3Database, seedPath: strin
     }
 }
 
-export interface FootnoteEntry {
-    ref: string;
-    text: string;
-    page?: number;
-}
-
-export interface ServiceEntry {
+export interface Service {
     name: string;
     primary: boolean;
     inline_footnotes: string[];
     qualifier?: string;
 }
 
-export interface AllocationEntry {
+export interface AllocationRow {
     freq_start_hz: number;
     freq_end_hz: number;
     unit: string;
     page: number;
-    services: ServiceEntry[];
+    services: Service[];
     footnotes: string[];
     raw: string;
-    footnote_details?: {
-        australian: FootnoteEntry[];
-        international: FootnoteEntry[];
+    region?: number;  // only present on region rows (1/2/3)
+}
+
+export interface LookupResult {
+    match_count: number;
+    allocation: AllocationRow | null;
+    regions: {
+        1: AllocationRow | null;
+        2: AllocationRow | null;
+        3: AllocationRow | null;
+    };
+    resolved_footnotes?: Record<string, string>;
+    source: {
+        published_date: string | null;
+        last_patch_date: string | null;
     };
 }
 
-export interface SourceProvenance {
-    description: string | null;
-    published_date: string | null;
-    last_patch_date: string | null;
-    imported_at: string | null;
-}
+type RawDbRow = {
+    freq_start_hz: number;
+    freq_end_hz: number;
+    unit: string;
+    page: number;
+    services_json: string;
+    footnotes_json: string;
+    raw: string;
+};
 
-export interface FrequencyAllocationResult {
-    freq_hz: number;
-    frequency_display: string;
-    match_count: number;
-    allocations: AllocationEntry[];
-    source: SourceProvenance;
+function rowToAllocationRow(row: RawDbRow, region?: number): AllocationRow {
+    const result: AllocationRow = {
+        freq_start_hz: row.freq_start_hz,
+        freq_end_hz: row.freq_end_hz,
+        unit: row.unit,
+        page: row.page,
+        services: row.services_json ? JSON.parse(row.services_json) as Service[] : [],
+        footnotes: row.footnotes_json ? JSON.parse(row.footnotes_json) as string[] : [],
+        raw: row.raw,
+    };
+    if (region !== undefined) {
+        result.region = region;
+    }
+    return result;
 }
 
 /**
- * Look up the ARSP allocation(s) covering a given frequency in Hz.
+ * Look up the ARSP allocation covering a given frequency in Hz.
  *
- * Returns matching rows from spectrum_allocations with services and footnotes
- * parsed from JSON columns. When include_footnotes is true, also resolves
- * footnote text from spectrum_australian_footnotes and
- * spectrum_international_footnotes. Always returns an array shape
- * (`allocations: []`) regardless of match count.
+ * Returns the AU row as the primary surface plus R1/R2/R3 contrast rows.
+ * When includeFootnotes is true, resolves all footnote refs (AU + international)
+ * from both the AU row and region rows into a flat resolved_footnotes map.
  */
 export function lookupFrequencyAllocation(
     db: BetterSqlite3Database,
-    freq_hz: number,
-    include_footnotes: boolean,
-): FrequencyAllocationResult {
-    const rows = db.prepare(`
-        SELECT freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json, raw
-        FROM spectrum_allocations
-        WHERE ? BETWEEN freq_start_hz AND freq_end_hz
-        ORDER BY freq_start_hz, freq_end_hz
-    `).all(freq_hz) as Array<{
-        freq_start_hz: number;
-        freq_end_hz: number;
-        unit: string;
-        page: number;
-        services_json: string;
-        footnotes_json: string;
-        raw: string;
-    }>;
+    freqHz: number,
+    includeFootnotes: boolean = true,
+): LookupResult {
+    const auRows = db.prepare(
+        'SELECT freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json, raw FROM spectrum_allocations WHERE ? >= freq_start_hz AND ? < freq_end_hz ORDER BY freq_start_hz, freq_end_hz'
+    ).all(freqHz, freqHz) as RawDbRow[];
 
-    const allocations: AllocationEntry[] = rows.map(r => {
-        const services: ServiceEntry[] = r.services_json ? JSON.parse(r.services_json) as ServiceEntry[] : [];
-        const footnotes: string[] = r.footnotes_json ? JSON.parse(r.footnotes_json) as string[] : [];
-        const entry: AllocationEntry = {
-            freq_start_hz: r.freq_start_hz,
-            freq_end_hz: r.freq_end_hz,
-            unit: r.unit,
-            page: r.page,
-            services,
-            footnotes,
-            raw: r.raw,
-        };
-        if (include_footnotes && footnotes.length > 0) {
-            entry.footnote_details = resolveFootnotes(db, footnotes);
+    const allocation = auRows.length > 0 ? rowToAllocationRow(auRows[0]!) : null;
+    const matchCount = auRows.length;
+
+    const regions: { 1: AllocationRow | null; 2: AllocationRow | null; 3: AllocationRow | null } = { 1: null, 2: null, 3: null };
+    for (const region of [1, 2, 3] as const) {
+        const row = db.prepare(
+            'SELECT freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json, raw FROM spectrum_region_allocations WHERE region = ? AND ? >= freq_start_hz AND ? < freq_end_hz LIMIT 1'
+        ).get(region, freqHz, freqHz) as RawDbRow | undefined;
+        if (row) {
+            regions[region] = rowToAllocationRow(row, region);
         }
-        return entry;
-    });
+    }
 
-    return {
-        freq_hz,
-        frequency_display: formatFrequency(freq_hz),
-        match_count: allocations.length,
-        allocations,
-        source: readSourceProvenance(db),
+    const result: LookupResult = {
+        match_count: matchCount,
+        allocation,
+        regions,
+        source: readSourceMeta(db),
     };
+
+    if (includeFootnotes) {
+        const refs = new Set<string>();
+        for (const row of [allocation, regions[1], regions[2], regions[3]]) {
+            if (!row) continue;
+            for (const r of row.footnotes) refs.add(r);
+            for (const svc of row.services) {
+                for (const r of svc.inline_footnotes) refs.add(r);
+            }
+        }
+        const resolved: Record<string, string> = {};
+        for (const ref of refs) {
+            const isAu = /^AUS/i.test(ref);
+            const table = isAu ? 'spectrum_australian_footnotes' : 'spectrum_international_footnotes';
+            const row = db.prepare(`SELECT footnote_text FROM ${table} WHERE footnote_ref = ?`).get(ref) as { footnote_text?: string } | undefined;
+            if (row?.footnote_text) resolved[ref] = row.footnote_text;
+        }
+        result.resolved_footnotes = resolved;
+    }
+
+    return result;
 }
 
-function resolveFootnotes(db: BetterSqlite3Database, footnoteRefs: string[]): { australian: FootnoteEntry[]; international: FootnoteEntry[] } {
-    const auRefs = footnoteRefs.filter(t => /^AUS/i.test(t));
-    const intlRefs = footnoteRefs.filter(t => !/^AUS/i.test(t));
-
-    const fetch = (table: string, refs: string[]): FootnoteEntry[] => {
-        if (refs.length === 0) return [];
-        const placeholders = refs.map(() => '?').join(',');
-        const rows = db.prepare(
-            `SELECT footnote_ref AS ref, footnote_text AS text, page FROM ${table} WHERE footnote_ref IN (${placeholders})`
-        ).all(...refs) as FootnoteEntry[];
-        // Preserve input order:
-        const byRef = new Map(rows.map(r => [r.ref, r]));
-        return refs.map(r => byRef.get(r)).filter((r): r is FootnoteEntry => r !== undefined);
-    };
-
+function readSourceMeta(db: BetterSqlite3Database): { published_date: string | null; last_patch_date: string | null } {
+    const published = db.prepare("SELECT value FROM spectrum_plan_meta WHERE key = 'published_date'").get() as { value?: string } | undefined;
+    const lastPatch = db.prepare("SELECT value FROM spectrum_plan_meta WHERE key = 'last_patch_date'").get() as { value?: string } | undefined;
     return {
-        australian: fetch('spectrum_australian_footnotes', auRefs),
-        international: fetch('spectrum_international_footnotes', intlRefs),
+        published_date: published?.value ?? null,
+        last_patch_date: lastPatch?.value ?? null,
     };
-}
-
-function readSourceProvenance(db: BetterSqlite3Database): SourceProvenance {
-    const rows = db.prepare('SELECT key, value FROM spectrum_plan_meta').all() as Array<{ key: string; value: string }>;
-    const map: Record<string, string> = {};
-    for (const r of rows) map[r.key] = r.value;
-    return {
-        description: map['source_title'] ?? map['source_description'] ?? null,
-        published_date: map['published_date'] ?? null,
-        last_patch_date: map['last_patch_date'] ?? null,
-        imported_at: map['imported_at'] ?? null,
-    };
-}
-
-function formatFrequency(hz: number): string {
-    if (hz < 1_000) return `${hz} Hz`;
-    if (hz < 1_000_000) return `${(hz / 1_000).toFixed(3)} kHz`;
-    if (hz < 1_000_000_000) return `${(hz / 1_000_000).toFixed(3)} MHz`;
-    return `${(hz / 1_000_000_000).toFixed(3)} GHz`;
 }
 
 /**
