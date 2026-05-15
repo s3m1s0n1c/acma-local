@@ -316,6 +316,21 @@ const ALL_SAMPLE_QUERIES: SampleQuery[] = [
               select s.sv_name, a.n
               from active a join licence_service s on s.sv_id = a.sv_id
               order by a.n desc limit 10` },
+
+    // ── emission designator joins
+    { category: 'power-user', description: 'Most common modulation type across all devices',
+      query: `SELECT m.description, m.group_name, COUNT(*) AS device_count
+FROM device_details d
+JOIN emission_modulation m ON SUBSTR(TRIM(d.EMISSION), 5, 1) = m.code
+WHERE LENGTH(TRIM(d.EMISSION)) >= 7
+GROUP BY m.code
+ORDER BY device_count DESC;` },
+    { category: 'power-user', description: 'All FM analogue telephony devices (classic VHF/UHF land mobile)',
+      query: `SELECT LICENCE_NO, FREQUENCY, EMISSION, TRANSMITTER_POWER, TRANSMITTER_POWER_UNIT
+FROM device_details
+WHERE SUBSTR(TRIM(EMISSION), 5, 3) = 'F3E'
+ORDER BY FREQUENCY
+LIMIT 100;` },
 ];
 
 export function listSampleQueries(filter?: {
