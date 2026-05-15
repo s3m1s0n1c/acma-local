@@ -242,16 +242,14 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
   "spectrum_allocations": {
     "ddl": `
       CREATE TABLE IF NOT EXISTS spectrum_allocations(
-        freq_start_hz INTEGER,
-        freq_end_hz INTEGER,
-        frequency_range TEXT,
+        freq_start_hz INTEGER NOT NULL,
+        freq_end_hz INTEGER NOT NULL,
         unit TEXT,
-        region1 TEXT,
-        region2 TEXT,
-        region3 TEXT,
-        australian_table_of_allocations TEXT,
-        common TEXT,
-        footnote_ref TEXT
+        page INTEGER,
+        services_json TEXT,
+        footnotes_json TEXT,
+        raw TEXT,
+        PRIMARY KEY (freq_start_hz, freq_end_hz)
       );
     `,
     "post_load_ddl": `
@@ -259,11 +257,33 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
         ON spectrum_allocations(freq_start_hz, freq_end_hz);
     `
   },
+  "spectrum_region_allocations": {
+    "ddl": `
+      CREATE TABLE IF NOT EXISTS spectrum_region_allocations(
+        region INTEGER NOT NULL,
+        freq_start_hz INTEGER NOT NULL,
+        freq_end_hz INTEGER NOT NULL,
+        unit TEXT,
+        page INTEGER,
+        services_json TEXT,
+        footnotes_json TEXT,
+        raw TEXT,
+        PRIMARY KEY (region, freq_start_hz, freq_end_hz)
+      );
+    `,
+    "post_load_ddl": `
+      CREATE INDEX IF NOT EXISTS idx_spectrum_region_alloc_range
+        ON spectrum_region_allocations(freq_start_hz, freq_end_hz);
+      CREATE INDEX IF NOT EXISTS idx_spectrum_region_alloc_region
+        ON spectrum_region_allocations(region);
+    `
+  },
   "spectrum_australian_footnotes": {
     "ddl": `
       CREATE TABLE IF NOT EXISTS spectrum_australian_footnotes(
-        footnote_ref TEXT,
-        footnote_text TEXT
+        footnote_ref TEXT PRIMARY KEY,
+        footnote_text TEXT NOT NULL,
+        page INTEGER
       );
     `,
     "post_load_ddl": `
@@ -274,8 +294,9 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
   "spectrum_international_footnotes": {
     "ddl": `
       CREATE TABLE IF NOT EXISTS spectrum_international_footnotes(
-        footnote_ref TEXT,
-        footnote_text TEXT
+        footnote_ref TEXT PRIMARY KEY,
+        footnote_text TEXT NOT NULL,
+        page INTEGER
       );
     `,
     "post_load_ddl": `
