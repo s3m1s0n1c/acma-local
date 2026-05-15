@@ -1,6 +1,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { initializeDatabase } from '../src/db.js';
+import Database from 'better-sqlite3';
 import axios from 'axios';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -19,6 +20,16 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         // Ensure a valid (empty) database exists before the server starts
         if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
         initializeDatabase(testDbPath);
+
+        // Seed emission lookup tables so search_devices_by_emission can resolve descriptions.
+        {
+            const seedPath = path.resolve(__dirname, '..', 'seed', 'emissions.sql');
+            const db = new Database(testDbPath);
+            try {
+                const { applyEmissionReseed } = await import('../src/emissions.js');
+                applyEmissionReseed(db, seedPath);
+            } finally { db.close(); }
+        }
 
         console.log(`Starting server on port ${PORT}...`);
         serverProcess = spawn('npx', ['tsx', 'src/index.ts'], {
@@ -195,7 +206,7 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         await transport.close();
     }, 15000);
 
-    test('tools/list advertises the full 16-tool catalog', async () => {
+    test('tools/list advertises the full 18-tool catalog', async () => {
         const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
         const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
         await client.connect(transport);
@@ -204,7 +215,9 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         expect(tools.tools.some(t => t.name === 'describe_tool')).toBe(true);
         expect(tools.tools.some(t => t.name === 'explain_query')).toBe(true);
         expect(tools.tools.some(t => t.name === 'get_frequency_allocation')).toBe(true);
-        expect(tools.tools.length).toBe(16);
+        expect(tools.tools.some(t => t.name === 'decode_emission_designator')).toBe(true);
+        expect(tools.tools.some(t => t.name === 'search_devices_by_emission')).toBe(true);
+        expect(tools.tools.length).toBe(18);
 
         await transport.close();
     }, 15000);
@@ -302,6 +315,103 @@ COMMIT;
 
     // ─── End get_frequency_allocation tests ───────────────────────────────────
 
+    // ─── decode_emission_designator + search_devices_by_emission tests ────────
+
+    test('decode_emission_designator: happy path', async () => {
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+        const res = await client.callTool({ name: 'decode_emission_designator', arguments: { code: '16K0F3E' } });
+        const payload = JSON.parse((res.content as any)[0].text);
+        expect(payload.valid).toBe(true);
+        expect(payload.bandwidth.value_hz).toBe(16000);
+        expect(payload.modulation.code).toBe('F');
+        expect(payload.info_type.code).toBe('E');
+        expect(payload._hints.some((h: any) => h.tool === 'search_devices_by_emission' && h.args?.modulation === 'F')).toBe(true);
+        await transport.close();
+    }, 15000);
+
+    test('decode_emission_designator: empty input', async () => {
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+        const res = await client.callTool({ name: 'decode_emission_designator', arguments: { code: '' } });
+        const payload = JSON.parse((res.content as any)[0].text);
+        expect(payload.valid).toBe(false);
+        expect(payload.warnings.length).toBeGreaterThan(0);
+        // No _hints key emitted on invalid path.
+        expect(payload._hints).toBeUndefined();
+        await transport.close();
+    }, 15000);
+
+    test('search_devices_by_emission: happy path with seeded fixture', async () => {
+        // The test DB starts empty for device_details; insert two rows so the search has something to find.
+        const fixtureDb = new Database(testDbPath);
+        try {
+            fixtureDb.prepare(`INSERT INTO device_details(SDD_ID, LICENCE_NO, EMISSION, FREQUENCY, SITE_ID) VALUES
+                (9001, 'TEST-L1', '16K0F3E', 150000000, NULL),
+                (9002, 'TEST-L2', '10M0W7D', 2400000000, NULL)`).run();
+        } finally { fixtureDb.close(); }
+
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'F', info_type: 'E' } });
+        const payload = JSON.parse((res.content as any)[0].text);
+        expect(payload._error).toBeUndefined();
+        expect(payload.rows.length).toBeGreaterThanOrEqual(1);
+        expect(payload.rows[0].decoded.modulation_code).toBe('F');
+        expect(payload.rows[0].decoded.info_type_description).toContain('Telephony');
+        expect(payload.resolved_filters.modulation.code).toBe('F');
+        expect(payload._hints?.length).toBeGreaterThan(0);
+        await transport.close();
+    }, 20000);
+
+    test('search_devices_by_emission: description-resolution path', async () => {
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'frequency modulation', info_type: 'telephony' } });
+        const payload = JSON.parse((res.content as any)[0].text);
+        expect(payload._error).toBeUndefined();
+        expect(payload.resolved_filters.modulation.code).toBe('F');
+        expect(payload.resolved_filters.info_type.code).toBe('E');
+        await transport.close();
+    }, 15000);
+
+    test('search_devices_by_emission: ambiguous description returns candidate list', async () => {
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'sideband' } });
+        const payload = JSON.parse((res.content as any)[0].text);
+        expect(payload._error).toBeDefined();
+        expect(payload._error).toContain('ambiguous');
+        await transport.close();
+    }, 15000);
+
+    test('search_devices_by_emission: no filters returns error', async () => {
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: {} });
+        const payload = JSON.parse((res.content as any)[0].text);
+        expect(payload._error).toBe('At least one filter is required.');
+        await transport.close();
+    }, 15000);
+
+    test('search_devices_by_emission: unknown code letter returns error', async () => {
+        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
+        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+        await client.connect(transport);
+        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'Z' } });
+        const payload = JSON.parse((res.content as any)[0].text);
+        expect(payload._error).toContain('Z');
+        await transport.close();
+    }, 15000);
+
+    // ─── End emission tests ───────────────────────────────────────────────────
+
     test('every advertised tool has a TOOL_DOCS entry', async () => {
         // Read TOOL_DOCS via dynamic import to avoid module side-effects at file load time.
         const { TOOL_DOCS } = await import('../src/index');
@@ -310,6 +420,7 @@ COMMIT;
             'search_clients', 'search_bsl', 'search_spectrum_band', 'search_application_text',
             'get_frequency_allocation', 'sync_data', 'list_sample_queries', 'execute_sql',
             'export_kml', 'describe_schema', 'describe_tool', 'explain_query',
+            'decode_emission_designator', 'search_devices_by_emission',
         ];
         for (const name of advertised) {
             expect(TOOL_DOCS[name]).toBeDefined();
