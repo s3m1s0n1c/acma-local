@@ -5,10 +5,10 @@
  */
 
 import type { Database as BetterSqlite3Database } from 'better-sqlite3';
-import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from './logger.js';
+import { TABLE_METADATA } from './db.js';
 
 const UNIT_MULTIPLIER: Record<string, number> = {
     'Hz': 1,
@@ -81,176 +81,59 @@ export function parseFrequencyRange(rangeText: string, unit: string): { freq_sta
 
 const SPECTRUM_TABLES = [
     'spectrum_allocations',
+    'spectrum_region_allocations',
     'spectrum_australian_footnotes',
     'spectrum_international_footnotes',
     'spectrum_plan_meta',
 ] as const;
 
 /**
- * Wipe all spectrum_* tables and repopulate from a seed source.
- *
- * Source detection:
- *   - .sql / .SQL  → read as text, db.exec()
- *   - .db / .sqlite / any other → opened as SQLite, copied via SELECT
- *     with parseFrequencyRange normalisation
- *
- * The entire operation (wipe + load + meta updates) runs under a single
- * SAVEPOINT so a failure during load rolls back to the prior state rather
- * than leaving the spectrum tables empty.
- *
- * Always updates spectrum_plan_meta.imported_at to the current ISO timestamp.
+ * Drop and recreate all spectrum_* tables using the current DDL from TABLE_METADATA.
+ * Used when a legacy schema is detected, to migrate to the new column layout.
  */
-export function applyReseed(db: BetterSqlite3Database, sourcePath: string): void {
-    if (!fs.existsSync(sourcePath)) {
-        throw new Error(`applyReseed: source not found: ${sourcePath}`);
-    }
-
-    const ext = path.extname(sourcePath).toLowerCase();
-    const isSql = ext === '.sql';
-
-    const savepoint = 'spectrum_reseed';
-    db.exec(`SAVEPOINT ${savepoint}`);
-    try {
-        for (const t of SPECTRUM_TABLES) {
-            db.exec(`DELETE FROM ${t};`);
-        }
-
-        if (isSql) {
-            const rawSql = fs.readFileSync(sourcePath, 'utf-8');
-            const stripped = rawSql
-                .replace(/^\s*BEGIN\s+TRANSACTION\s*;/gim, '')
-                .replace(/^\s*COMMIT\s*;/gim, '');
-            db.exec(stripped);
-        } else {
-            copyFromSourceDb(db, sourcePath);
-        }
-
-        const now = new Date().toISOString();
-        db.prepare('INSERT OR REPLACE INTO spectrum_plan_meta(key, value) VALUES(?, ?)')
-            .run('imported_at', now);
-
-        const counts = {
-            allocations: (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as any).n,
-            au_footnotes: (db.prepare('SELECT COUNT(*) AS n FROM spectrum_australian_footnotes').get() as any).n,
-            intl_footnotes: (db.prepare('SELECT COUNT(*) AS n FROM spectrum_international_footnotes').get() as any).n,
-        };
-        db.prepare('INSERT OR REPLACE INTO spectrum_plan_meta(key, value) VALUES(?, ?)')
-            .run('row_counts', JSON.stringify(counts));
-
-        db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-        log.info(`[SPECTRUM] Reseeded: ${counts.allocations} allocations, ${counts.au_footnotes} AU footnotes, ${counts.intl_footnotes} intl footnotes`);
-    } catch (e) {
-        db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
-        throw e;
+export function resetSpectrumTables(db: BetterSqlite3Database): void {
+    db.exec(`
+        DROP TABLE IF EXISTS spectrum_allocations;
+        DROP TABLE IF EXISTS spectrum_region_allocations;
+        DROP TABLE IF EXISTS spectrum_australian_footnotes;
+        DROP TABLE IF EXISTS spectrum_international_footnotes;
+        DROP TABLE IF EXISTS spectrum_plan_meta;
+    `);
+    for (const name of SPECTRUM_TABLES) {
+        const meta = TABLE_METADATA[name];
+        if (!meta) continue;
+        db.exec(meta.ddl);
+        if (meta.post_load_ddl) db.exec(meta.post_load_ddl);
     }
 }
 
 /**
- * Dump the four spectrum_* tables to a .sql file suitable for re-applying
- * via applyReseed(). DDL is owned by TABLE_METADATA so we only emit
- * INSERT statements wrapped in a single transaction.
+ * Returns true if spectrum_allocations exists but has the old column layout
+ * (pre-Task-9 schema: frequency_range TEXT or region1 TEXT columns).
  */
-export function dumpSpectrumPlan(db: BetterSqlite3Database, outPath: string): void {
-    const lines: string[] = ['BEGIN TRANSACTION;'];
-
-    for (const table of SPECTRUM_TABLES) {
-        const rows = db.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
-        if (rows.length === 0) continue;
-        const cols = Object.keys(rows[0]!);
-        const colList = cols.join(', ');
-        for (const row of rows) {
-            const values = cols.map(c => sqlLiteral(row[c])).join(', ');
-            lines.push(`INSERT INTO ${table}(${colList}) VALUES(${values});`);
-        }
-    }
-
-    lines.push('COMMIT;');
-    fs.writeFileSync(outPath, lines.join('\n') + '\n');
-    log.info(`[SPECTRUM] Wrote ${outPath} (${lines.length - 2} INSERT statements)`);
-}
-
-function sqlLiteral(v: unknown): string {
-    if (v === null || v === undefined) return 'NULL';
-    if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'NULL';
-    if (typeof v === 'bigint') return v.toString();
-    if (typeof v === 'boolean') return v ? '1' : '0';
-    // Strings: double single quotes, wrap in single quotes.
-    const s = String(v).replace(/'/g, "''");
-    return `'${s}'`;
-}
-
-/**
- * Copy data from a pre-built source SQLite database into the runtime spectrum_* tables.
- * The source uses the legacy schema (frequency_range TEXT + unit TEXT); we normalise
- * to freq_start_hz/freq_end_hz here using parseFrequencyRange.
- *
- * Source schema (from /Projects/ACMA/frequency_allocations.db):
- *   allocations(frequency_range, unit, region1, region2, region3,
- *               australian_table_of_allocations, common, footnote_ref)
- *   australian_footnotes(footnote_ref, footnote_text)
- *   international_footnotes(footnote_ref, footnote_text)
- */
-function copyFromSourceDb(db: BetterSqlite3Database, sourcePath: string): void {
-    const src = new Database(sourcePath, { readonly: true, fileMustExist: true });
-    try {
-        const allocs = src.prepare(`
-            SELECT frequency_range, unit, region1, region2, region3,
-                   australian_table_of_allocations, common, footnote_ref
-            FROM allocations
-        `).all() as any[];
-
-        const insertAlloc = db.prepare(`
-            INSERT INTO spectrum_allocations(
-                freq_start_hz, freq_end_hz, frequency_range, unit,
-                region1, region2, region3,
-                australian_table_of_allocations, common, footnote_ref
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
-        db.transaction(() => {
-            for (const row of allocs) {
-                if (!row.frequency_range || !row.unit) {
-                    log.warn(`[SPECTRUM] skip row (missing range or unit): range="${row.frequency_range}" unit="${row.unit}"`);
-                    continue;
-                }
-                let bounds: { freq_start_hz: number; freq_end_hz: number };
-                try {
-                    bounds = parseFrequencyRange(row.frequency_range, row.unit);
-                } catch (e) {
-                    log.warn(`[SPECTRUM] skip row (parse failure): "${row.frequency_range}" ${row.unit} — ${(e as Error).message}`);
-                    continue;
-                }
-                insertAlloc.run(
-                    bounds.freq_start_hz, bounds.freq_end_hz,
-                    row.frequency_range ?? '', row.unit ?? '',
-                    row.region1 ?? '', row.region2 ?? '', row.region3 ?? '',
-                    row.australian_table_of_allocations ?? '', row.common ?? '', row.footnote_ref ?? ''
-                );
-            }
-
-            // Source DB uses columns `ref` and `text` (not footnote_ref/footnote_text).
-            const auRows = src.prepare('SELECT ref AS footnote_ref, text AS footnote_text FROM australian_footnotes').all() as any[];
-            const insertAu = db.prepare('INSERT INTO spectrum_australian_footnotes(footnote_ref, footnote_text) VALUES(?, ?)');
-            for (const r of auRows) insertAu.run(r.footnote_ref, r.footnote_text);
-
-            const intlRows = src.prepare('SELECT ref AS footnote_ref, text AS footnote_text FROM international_footnotes').all() as any[];
-            const insertIntl = db.prepare('INSERT INTO spectrum_international_footnotes(footnote_ref, footnote_text) VALUES(?, ?)');
-            for (const r of intlRows) insertIntl.run(r.footnote_ref, r.footnote_text);
-        })();
-    } finally {
-        if (src.open) src.close();
-    }
+export function spectrumSchemaIsLegacy(db: BetterSqlite3Database): boolean {
+    const cols = db.prepare("PRAGMA table_info(spectrum_allocations)").all() as Array<{ name: string }>;
+    if (cols.length === 0) return false;
+    return cols.some(c => c.name === 'frequency_range' || c.name === 'region1');
 }
 
 /**
  * Auto-bootstrap helper: if spectrum_allocations is empty AND the seed file
- * exists at the given path, apply it. Used at the tail of performFullSync so
- * that "delete acma.db and rebuild" produces a complete schema.
+ * exists at the given path, apply it. If the table has the legacy schema,
+ * drops and recreates all spectrum_* tables first.
  *
- * Failure modes are non-fatal — a missing/malformed seed logs a warning and
- * leaves spectrum tables empty (the MCP server still runs without them).
+ * Used at the tail of performFullSync so that "delete acma.db and rebuild"
+ * produces a complete schema. Failure modes are non-fatal — a missing/malformed
+ * seed logs a warning and leaves spectrum tables empty (the MCP server still
+ * runs without them).
  */
 export function bootstrapSpectrumPlan(db: BetterSqlite3Database, seedPath: string): void {
+    // Migrate legacy schema if present.
+    if (spectrumSchemaIsLegacy(db)) {
+        console.error('[SPECTRUM] Legacy schema detected — dropping and recreating spectrum tables.');
+        resetSpectrumTables(db);
+    }
+
     const n = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
     if (n > 0) {
         return;
@@ -261,7 +144,8 @@ export function bootstrapSpectrumPlan(db: BetterSqlite3Database, seedPath: strin
     }
     try {
         log.info(`[SPECTRUM] Bootstrapping spectrum tables from ${seedPath}`);
-        applyReseed(db, seedPath);
+        const sql = fs.readFileSync(seedPath, 'utf-8');
+        db.exec(sql);
     } catch (e) {
         log.error(`[SPECTRUM] Bootstrap failed: ${(e as Error).message}. Spectrum tables remain empty.`);
     }
@@ -270,18 +154,25 @@ export function bootstrapSpectrumPlan(db: BetterSqlite3Database, seedPath: strin
 export interface FootnoteEntry {
     ref: string;
     text: string;
+    page?: number;
+}
+
+export interface ServiceEntry {
+    name: string;
+    primary: boolean;
+    inline_footnotes: string[];
+    qualifier?: string;
 }
 
 export interface AllocationEntry {
-    frequency_range: string;
+    freq_start_hz: number;
+    freq_end_hz: number;
     unit: string;
-    region1: string;
-    region2: string;
-    region3: string;
-    australian_table_of_allocations: string;
-    common: string;
-    footnote_ref: string;
-    footnotes?: {
+    page: number;
+    services: ServiceEntry[];
+    footnotes: string[];
+    raw: string;
+    footnote_details?: {
         australian: FootnoteEntry[];
         international: FootnoteEntry[];
     };
@@ -305,8 +196,10 @@ export interface FrequencyAllocationResult {
 /**
  * Look up the ARSP allocation(s) covering a given frequency in Hz.
  *
- * Returns matching rows with their footnotes joined (when include_footnotes
- * is true) plus a source-provenance block. Always returns an array shape
+ * Returns matching rows from spectrum_allocations with services and footnotes
+ * parsed from JSON columns. When include_footnotes is true, also resolves
+ * footnote text from spectrum_australian_footnotes and
+ * spectrum_international_footnotes. Always returns an array shape
  * (`allocations: []`) regardless of match count.
  */
 export function lookupFrequencyAllocation(
@@ -315,17 +208,34 @@ export function lookupFrequencyAllocation(
     include_footnotes: boolean,
 ): FrequencyAllocationResult {
     const rows = db.prepare(`
-        SELECT frequency_range, unit, region1, region2, region3,
-               australian_table_of_allocations, common, footnote_ref
+        SELECT freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json, raw
         FROM spectrum_allocations
         WHERE ? BETWEEN freq_start_hz AND freq_end_hz
         ORDER BY freq_start_hz, freq_end_hz
-    `).all(freq_hz) as Array<Omit<AllocationEntry, 'footnotes'>>;
+    `).all(freq_hz) as Array<{
+        freq_start_hz: number;
+        freq_end_hz: number;
+        unit: string;
+        page: number;
+        services_json: string;
+        footnotes_json: string;
+        raw: string;
+    }>;
 
     const allocations: AllocationEntry[] = rows.map(r => {
-        const entry: AllocationEntry = { ...r };
-        if (include_footnotes) {
-            entry.footnotes = resolveFootnotes(db, r.footnote_ref ?? '');
+        const services: ServiceEntry[] = r.services_json ? JSON.parse(r.services_json) as ServiceEntry[] : [];
+        const footnotes: string[] = r.footnotes_json ? JSON.parse(r.footnotes_json) as string[] : [];
+        const entry: AllocationEntry = {
+            freq_start_hz: r.freq_start_hz,
+            freq_end_hz: r.freq_end_hz,
+            unit: r.unit,
+            page: r.page,
+            services,
+            footnotes,
+            raw: r.raw,
+        };
+        if (include_footnotes && footnotes.length > 0) {
+            entry.footnote_details = resolveFootnotes(db, footnotes);
         }
         return entry;
     });
@@ -339,23 +249,24 @@ export function lookupFrequencyAllocation(
     };
 }
 
-function resolveFootnotes(db: BetterSqlite3Database, footnoteRef: string): { australian: FootnoteEntry[]; international: FootnoteEntry[] } {
-    const tokens = footnoteRef.split(/[\s,]+/).filter(t => t.length > 0);
-    const auTokens = tokens.filter(t => /^AUS/i.test(t));
-    const intlTokens = tokens.filter(t => !/^AUS/i.test(t));
+function resolveFootnotes(db: BetterSqlite3Database, footnoteRefs: string[]): { australian: FootnoteEntry[]; international: FootnoteEntry[] } {
+    const auRefs = footnoteRefs.filter(t => /^AUS/i.test(t));
+    const intlRefs = footnoteRefs.filter(t => !/^AUS/i.test(t));
 
     const fetch = (table: string, refs: string[]): FootnoteEntry[] => {
         if (refs.length === 0) return [];
         const placeholders = refs.map(() => '?').join(',');
-        const rows = db.prepare(`SELECT footnote_ref AS ref, footnote_text AS text FROM ${table} WHERE footnote_ref IN (${placeholders})`).all(...refs) as FootnoteEntry[];
+        const rows = db.prepare(
+            `SELECT footnote_ref AS ref, footnote_text AS text, page FROM ${table} WHERE footnote_ref IN (${placeholders})`
+        ).all(...refs) as FootnoteEntry[];
         // Preserve input order:
         const byRef = new Map(rows.map(r => [r.ref, r]));
         return refs.map(r => byRef.get(r)).filter((r): r is FootnoteEntry => r !== undefined);
     };
 
     return {
-        australian: fetch('spectrum_australian_footnotes', auTokens),
-        international: fetch('spectrum_international_footnotes', intlTokens),
+        australian: fetch('spectrum_australian_footnotes', auRefs),
+        international: fetch('spectrum_international_footnotes', intlRefs),
     };
 }
 
@@ -364,7 +275,7 @@ function readSourceProvenance(db: BetterSqlite3Database): SourceProvenance {
     const map: Record<string, string> = {};
     for (const r of rows) map[r.key] = r.value;
     return {
-        description: map['source_description'] ?? null,
+        description: map['source_title'] ?? map['source_description'] ?? null,
         published_date: map['published_date'] ?? null,
         last_patch_date: map['last_patch_date'] ?? null,
         imported_at: map['imported_at'] ?? null,
@@ -379,29 +290,21 @@ function formatFrequency(hz: number): string {
 }
 
 /**
- * Apply a hand-written SQL patch file (typically UPDATEs / INSERTs / DELETEs
- * derived from an ACMA legislative amendment). Trusted input — the curator
- * wrote it. Records last_patch_date in spectrum_plan_meta.
- *
- * Warns on >50% allocation loss as a sanity check for accidentally
- * destructive patches.
+ * @deprecated Use generate-spectrum-seed.ts CLI (npx tsx scripts/generate-spectrum-seed.ts)
+ * instead. Kept for backwards compatibility only.
  */
-export function applyPatch(db: BetterSqlite3Database, patchPath: string): void {
-    if (!fs.existsSync(patchPath)) {
-        throw new Error(`applyPatch: patch file not found: ${patchPath}`);
+export function applyReseed(db: BetterSqlite3Database, sourcePath: string): void {
+    if (!fs.existsSync(sourcePath)) {
+        throw new Error(`applyReseed: source not found: ${sourcePath}`);
     }
-    const sql = fs.readFileSync(patchPath, 'utf-8');
-
-    const before = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+    const ext = path.extname(sourcePath).toLowerCase();
+    if (ext !== '.sql') {
+        throw new Error(`applyReseed: only .sql sources are supported in the new pipeline. Got: ${sourcePath}`);
+    }
+    resetSpectrumTables(db);
+    const sql = fs.readFileSync(sourcePath, 'utf-8');
     db.exec(sql);
-    const after = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
-
-    if (before > 0 && after < before / 2) {
-        log.warn(`[SPECTRUM] WARNING: patch reduced allocations from ${before} to ${after} (>50% deletion).`);
-    }
-
-    const today = new Date().toISOString().slice(0, 10);
-    db.prepare('INSERT OR REPLACE INTO spectrum_plan_meta(key, value) VALUES(?, ?)').run('last_patch_date', today);
-
-    log.info(`[SPECTRUM] Applied patch ${patchPath} (allocations ${before} -> ${after})`);
+    const now = new Date().toISOString();
+    db.prepare('INSERT OR REPLACE INTO spectrum_plan_meta(key, value) VALUES(?, ?)').run('imported_at', now);
+    log.info(`[SPECTRUM] Reseeded from ${sourcePath}`);
 }

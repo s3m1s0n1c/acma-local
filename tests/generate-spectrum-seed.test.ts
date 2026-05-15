@@ -27,7 +27,7 @@ describe('generateSeedSql', () => {
         expect(sql).toContain('BEGIN TRANSACTION;');
         expect(sql).toMatch(/COMMIT;\s*$/);
         expect(sql).toContain("INSERT INTO spectrum_allocations");
-        expect(sql).toContain("INSERT INTO spectrum_australian_footnotes");
+        expect(sql).toMatch(/INSERT( OR REPLACE)? INTO spectrum_australian_footnotes/);
         expect(sql).toContain("'pdf_sha256'");
         expect(sql).toContain("'abc'");
     });

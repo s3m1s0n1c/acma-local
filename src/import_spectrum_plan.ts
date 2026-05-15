@@ -2,27 +2,32 @@
  * CLI entry point for spectrum-plan operations.
  *
  * Usage:
- *   npm run import-spectrum-plan -- --reseed [--source <path.sql|path.db>]
- *   npm run import-spectrum-plan -- --patch <path.sql>
- *   npm run dump-spectrum-plan
+ *   npm run import-spectrum-plan -- --reseed [--patch <path.yaml>]
+ *   npm run import-spectrum-plan -- --patch <path.yaml>
  *
- * All paths resolved relative to process.cwd().
+ * --patch <file>   Copy <file> into seed/patches/, then regenerate seed/spectrum_plan.sql.
+ * --reseed         After regenerating the SQL seed, apply it to the runtime DB
+ *                  (drops + recreates spectrum tables, then loads).
+ *
+ * Patch-only (--patch without --reseed) just updates the seed file; the new
+ * data is picked up the next time the DB is bootstrapped or --reseed is used.
  */
 import Database from 'better-sqlite3';
 import * as path from 'path';
 import * as fs from 'fs';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import { initializeDatabase } from './db.js';
-import { applyReseed, applyPatch, dumpSpectrumPlan } from './spectrum_plan.js';
+import { resetSpectrumTables } from './spectrum_plan.js';
 import { DEFAULT_CONFIG } from './sync.js';
 import { log } from './logger.js';
 
-const DEFAULT_SEED_PATH = path.resolve('seed/spectrum_plan.sql');
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function usage(): never {
     console.error(`Usage:
-  tsx src/import_spectrum_plan.ts --reseed [--source <path.sql|path.db>]
-  tsx src/import_spectrum_plan.ts --patch <path.sql>
-  tsx src/import_spectrum_plan.ts dump [--out <path>]
+  npm run import-spectrum-plan -- --reseed [--patch <path.yaml>]
+  npm run import-spectrum-plan -- --patch <path.yaml>
 `);
     process.exit(1);
 }
@@ -34,48 +39,49 @@ function getArg(argv: string[], flag: string): string | undefined {
 
 function main() {
     const argv = process.argv.slice(2);
-    const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
+    if (argv.length === 0) usage();
 
-    // Always ensure the schema exists. initializeDatabase uses CREATE TABLE
-    // IF NOT EXISTS, so this is idempotent on existing DBs and adds any
-    // tables that landed in later code versions (e.g. spectrum_* added after
-    // the DB was first synced under an older schema).
-    if (!fs.existsSync(dbPath)) {
-        log.info(`Initialising new DB at ${dbPath}`);
+    const reseed = argv.includes('--reseed');
+    const patchArg = getArg(argv, '--patch');
+
+    if (!reseed && !patchArg) usage();
+
+    // If a patch file was provided, copy it into seed/patches/ first.
+    if (patchArg) {
+        if (!fs.existsSync(patchArg)) {
+            console.error(`Error: patch file not found: ${patchArg}`);
+            process.exit(1);
+        }
+        const patchesDir = path.join(repoRoot, 'seed', 'patches');
+        fs.mkdirSync(patchesDir, { recursive: true });
+        const dest = path.join(patchesDir, path.basename(patchArg));
+        fs.copyFileSync(patchArg, dest);
+        console.error(`Copied patch to ${dest}`);
     }
-    initializeDatabase(dbPath);
 
-    if (argv[0] === 'dump') {
-        const outPath = getArg(argv, '--out') ?? DEFAULT_SEED_PATH;
-        const outDir = path.dirname(outPath);
-        if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    // Regenerate seed/spectrum_plan.sql from YAML source + any patches.
+    console.error('Regenerating seed/spectrum_plan.sql...');
+    execSync('npx tsx scripts/generate-spectrum-seed.ts', { stdio: 'inherit', cwd: repoRoot });
+
+    if (reseed) {
+        const dbPath = process.env.ACMA_DB_PATH ?? DEFAULT_CONFIG.dbPath;
+        if (!fs.existsSync(dbPath)) {
+            log.info(`Initialising new DB at ${dbPath}`);
+        }
+        initializeDatabase(dbPath);
+
         const db = new Database(dbPath);
         try {
-            dumpSpectrumPlan(db, outPath);
-        } finally { db.close(); }
-        return;
+            resetSpectrumTables(db);
+            const seedPath = path.join(repoRoot, 'seed', 'spectrum_plan.sql');
+            const sql = fs.readFileSync(seedPath, 'utf-8');
+            db.exec(sql);
+            const n = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
+            log.info(`[SPECTRUM] Reseeded: ${n} allocation rows loaded.`);
+        } finally {
+            db.close();
+        }
     }
-
-    if (argv.includes('--reseed')) {
-        const source = getArg(argv, '--source') ?? DEFAULT_SEED_PATH;
-        const db = new Database(dbPath);
-        try {
-            applyReseed(db, source);
-        } finally { db.close(); }
-        return;
-    }
-
-    if (argv.includes('--patch')) {
-        const patchPath = getArg(argv, '--patch');
-        if (!patchPath) usage();
-        const db = new Database(dbPath);
-        try {
-            applyPatch(db, patchPath!);
-        } finally { db.close(); }
-        return;
-    }
-
-    usage();
 }
 
 main();

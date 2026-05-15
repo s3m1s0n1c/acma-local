@@ -203,6 +203,7 @@ describe('Spectrum-plan tables', () => {
 
     test.each([
         'spectrum_allocations',
+        'spectrum_region_allocations',
         'spectrum_australian_footnotes',
         'spectrum_international_footnotes',
         'spectrum_plan_meta',
@@ -222,10 +223,12 @@ describe('Spectrum-plan tables', () => {
             const cols = (db.prepare('PRAGMA table_info(spectrum_allocations)').all() as any[])
                 .map(r => r.name);
             expect(cols).toEqual(expect.arrayContaining([
-                'freq_start_hz', 'freq_end_hz', 'frequency_range', 'unit',
-                'region1', 'region2', 'region3',
-                'australian_table_of_allocations', 'common', 'footnote_ref',
+                'freq_start_hz', 'freq_end_hz', 'unit', 'page',
+                'services_json', 'footnotes_json', 'raw',
             ]));
+            // Old schema columns must not be present.
+            expect(cols).not.toContain('frequency_range');
+            expect(cols).not.toContain('region1');
         } finally { db.close(); }
     });
 
