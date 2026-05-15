@@ -124,12 +124,12 @@ export function generateSeedSql(doc: SourceDoc): string {
     }
     for (const f of doc.au_footnotes) {
         lines.push(
-            `INSERT OR REPLACE INTO spectrum_australian_footnotes(footnote_ref, footnote_text, page) VALUES(${sqlString(f.ref)}, ${sqlString(f.text)}, ${f.page});`
+            `INSERT INTO spectrum_australian_footnotes(footnote_ref, footnote_text, page) VALUES(${sqlString(f.ref)}, ${sqlString(f.text)}, ${f.page});`
         );
     }
     for (const f of doc.intl_footnotes) {
         lines.push(
-            `INSERT OR REPLACE INTO spectrum_international_footnotes(footnote_ref, footnote_text, page) VALUES(${sqlString(f.ref)}, ${sqlString(f.text)}, ${f.page});`
+            `INSERT INTO spectrum_international_footnotes(footnote_ref, footnote_text, page) VALUES(${sqlString(f.ref)}, ${sqlString(f.text)}, ${f.page});`
         );
     }
 

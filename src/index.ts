@@ -351,7 +351,7 @@ Each \`services[]\` element:
     "unit": "MHz",
     "page": 42,
     "services": [
-      { "name": "BROADCASTING", "primary": true, "inline_footnotes": ["AUS37"], "qualifier": null }
+      { "name": "BROADCASTING", "primary": true, "inline_footnotes": ["AUS37"] }
     ],
     "footnotes": ["AUS37", "5.87"],
     "raw": "BROADCASTING AUS37"

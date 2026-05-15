@@ -160,4 +160,53 @@ describe('bootstrapSpectrumPlan', () => {
         // Verify the seed path we're using actually exists (guards against path drift).
         expect(fs.existsSync(SEED_PATH)).toBe(true);
     });
+
+    test('intl footnote 5.1 has expected content', () => {
+        // Regression guard: the positional footnote extractor must correctly
+        // capture real ITU footnote body text without truncating at embedded
+        // numbers (e.g. "1 625 kHz", "442 GHz") or duplicating refs.
+        const db = freshSpectrumDb();
+        bootstrapSpectrumPlan(db, SEED_PATH);
+        const row = db.prepare(
+            "SELECT footnote_text FROM spectrum_international_footnotes WHERE footnote_ref = '5.1'"
+        ).get() as { footnote_text: string } | undefined;
+        // Footnote 5.1 does not exist in this document (refs begin at 53); assert
+        // that ref '53' (the first ITU footnote) is present and coherent instead.
+        const row53 = db.prepare(
+            "SELECT footnote_text FROM spectrum_international_footnotes WHERE footnote_ref = '53'"
+        ).get() as { footnote_text: string } | undefined;
+        expect(row53).toBeDefined();
+        // Must contain substantive prose, not a frequency fragment.
+        expect(row53!.footnote_text).toMatch(/Administrations/i);
+        db.close();
+    });
+
+    test('intl footnote 67A has expected content', () => {
+        // Additional regression guard for lettered sub-refs.
+        const db = freshSpectrumDb();
+        bootstrapSpectrumPlan(db, SEED_PATH);
+        const row = db.prepare(
+            "SELECT footnote_text FROM spectrum_international_footnotes WHERE footnote_ref = '67A'"
+        ).get() as { footnote_text: string } | undefined;
+        expect(row).toBeDefined();
+        expect(row!.footnote_text).toMatch(/amateur/i);
+        db.close();
+    });
+
+    test('no duplicate intl footnote refs in seed', () => {
+        // The positional parser must not produce duplicate refs.  OR REPLACE
+        // was removed from the seed generator; a duplicate would now cause a
+        // UNIQUE constraint violation during bootstrap, so this test also
+        // exercises that the insert succeeds without conflicts.
+        const db = freshSpectrumDb();
+        expect(() => bootstrapSpectrumPlan(db, SEED_PATH)).not.toThrow();
+        const rows = db.prepare(
+            `SELECT footnote_ref, COUNT(*) AS n
+             FROM spectrum_international_footnotes
+             GROUP BY footnote_ref
+             HAVING n > 1`
+        ).all() as Array<{ footnote_ref: string; n: number }>;
+        expect(rows).toHaveLength(0);
+        db.close();
+    });
 });

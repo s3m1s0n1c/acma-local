@@ -69,7 +69,7 @@ Each tool's `tools/list` entry is a one-line summary + capability tag; the full 
 - **Narrative:** `applic_text_block` (~168 MB CSV), `reports_text_block`; FTS5 virtual table over `applic_text_block.APTB_TEXT` rebuilt during full sync.
 - **10 lookups:** `client_type`, `fee_status`, `industry_cat`, `licence_service`, `licence_subservice` (composite PK), `licence_status`, `nature_of_service`, `class_of_station`, `licensing_area`, `antenna_polarity`. JOINed by `src/logic.ts` to surface human-readable names.
 
-Schema does NOT declare primary keys — incremental application relies on `PK_BY_TABLE: Record<string, string | string[]>` in `src/sync.ts` for the DELETE step (string for single-column PKs; array for composites). The change-zip CSVs may use slightly different table names than the full extract (e.g. `device_detail` singular vs `device_details` plural) — `csvToTable` in `src/sync.ts` handles aliasing.
+RRL ETL tables (`client`, `licence`, `site`, `device_details`, `antenna`, etc.) do NOT declare primary keys — incremental application relies on `PK_BY_TABLE: Record<string, string | string[]>` in `src/sync.ts` for the DELETE step (string for single-column PKs; array for composites). The spectrum plan and emission lookup tables DO use DDL primary keys (e.g. `spectrum_allocations` has a composite PK on `freq_start_hz`+`freq_end_hz`). The change-zip CSVs may use slightly different table names than the full extract (e.g. `device_detail` singular vs `device_details` plural) — `csvToTable` in `src/sync.ts` handles aliasing.
 
 Runtime introspection: call the `describe_schema` MCP tool (or `describeSchema()` from `src/sql.ts`) to get columns + indexes + row counts for any table — the catalog is no longer hard-coded in `execute_sql`'s description.
 

@@ -294,7 +294,7 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         fs.writeFileSync(fixture, `BEGIN TRANSACTION;
 INSERT INTO spectrum_allocations(freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json, raw)
   VALUES(87000000, 108000000, 'MHz', 42,
-    '[{"name":"BROADCASTING","primary":true,"inline_footnotes":["AUS37"],"qualifier":null}]',
+    '[{"name":"BROADCASTING","primary":true,"inline_footnotes":["AUS37"]}]',
     '["AUS37","5.87"]',
     'BROADCASTING AUS37');
 INSERT INTO spectrum_australian_footnotes(footnote_ref, footnote_text) VALUES('AUS37', 'AUS37 body.');
