@@ -67,7 +67,58 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         expect(tools.tools).toBeDefined();
         expect(tools.tools.some(t => t.name === 'search_sites')).toBe(true);
 
+        const frequencyTool = tools.tools.find(t => t.name === 'search_frequency_assignments');
+        expect(frequencyTool?.inputSchema.properties).toHaveProperty('freq_min_mhz');
+        expect(frequencyTool?.inputSchema.properties).toHaveProperty('freq_min_hz');
+
         await transport.close();
+    }, 15000);
+
+    test('search_frequency_assignments accepts MHz and echoes the interpreted range', async () => {
+        const seedDb = new Database(testDbPath);
+        try {
+            seedDb.exec(`
+                INSERT INTO client (CLIENT_NO, LICENCEE) VALUES (9001, 'MHz Fixture Client');
+                INSERT INTO licence (LICENCE_NO, CLIENT_NO) VALUES ('MHZ-1', 9001);
+                INSERT INTO device_details (SDD_ID, LICENCE_NO, FREQUENCY) VALUES
+                    (9001, 'MHZ-1', 476625000),
+                    (9002, 'MHZ-1', 477000000);
+            `);
+        } finally { seedDb.close(); }
+
+        const response = await callMcpTool('search_frequency_assignments', {
+            freq_min_mhz: 476.425,
+            freq_max_mhz: 477.4125,
+        });
+        const parsed = JSON.parse(response);
+        expect(parsed.query).toMatchObject({
+            input_unit: 'MHz',
+            freq_min_hz: 476425000,
+            freq_max_hz: 477412500,
+        });
+        expect(parsed.rows).toHaveLength(2);
+        expect(parsed.rows[0]).toMatchObject({ LICENCE_NO: 'MHZ-1', FREQUENCY: 476625000 });
+        expect(parsed.rows_returned).toBe(2);
+        expect(parsed.rows_truncated).toBe(false);
+
+        const limitedResponse = await callMcpTool('search_frequency_assignments', {
+            freq_min_mhz: 476.425,
+            freq_max_mhz: 477.4125,
+            limit: 1,
+        });
+        const limited = JSON.parse(limitedResponse);
+        expect(limited.rows).toHaveLength(1);
+        expect(limited.rows_returned).toBe(1);
+        expect(limited.rows_truncated).toBe(true);
+    }, 15000);
+
+    test('search_frequency_assignments rejects mixed Hz and MHz fields', async () => {
+        const response = await callMcpTool('search_frequency_assignments', {
+            freq_min_mhz: 476.425,
+            freq_max_hz: 477412500,
+        });
+        const parsed = JSON.parse(response);
+        expect(parsed._error).toMatch(/either the \*_hz fields or the \*_mhz fields/i);
     }, 15000);
 
     test('should report sync progress', async () => {
@@ -330,6 +381,15 @@ COMMIT;
         expect(parsed._warning).toMatch(/8 years old|published 2018/);
         expect(parsed._hints).toBeDefined();
         expect(parsed._hints.some((h: any) => h.tool === 'search_licences')).toBe(true);
+
+        const mhzResponse = await callMcpTool('get_frequency_allocation', { freq_mhz: 87.1 });
+        const mhzParsed = JSON.parse(mhzResponse);
+        expect(mhzParsed.match_count).toBe(1);
+        expect(mhzParsed.query).toMatchObject({
+            input_unit: 'MHz',
+            freq_hz: 87100000,
+            freq_mhz: 87.1,
+        });
 
         fs.unlinkSync(fixture);
     }, 15000);

@@ -51,6 +51,8 @@ The local SQLite database is kept in step with ACMA via the manifest at `https:/
 
 **Tool catalog (20 tools, registered in `index.ts`):** `search_sites`, `get_site_details`, `search_licences`, `get_licence_details`, `search_clients`, `get_client_details`, `search_frequency_assignments`, `search_bsl`, `search_spectrum_band`, `search_application_text`, `get_frequency_allocation`, `decode_emission_designator`, `search_devices_by_emission`, `sync_data`, `list_sample_queries`, `execute_sql`, `explain_query`, `export_kml`, `describe_schema`, `describe_tool`.
 
+Frequency-facing tools accept either explicit `*_mhz` fields (preferred when the user says MHz) or `*_hz` fields (when the user explicitly says Hz). `src/frequency_input.ts` validates and normalizes these inputs; never mix units or ask the chat model to perform the conversion itself.
+
 Each tool's `tools/list` entry is a one-line summary + capability tag; the full markdown documentation lives in the `TOOL_DOCS` map and is fetched on demand via `describe_tool(name)`. Search-style tools return `{rows, _hints?}` envelopes — `_hints` carries follow-up tool suggestions (e.g. `search_licences` → `get_licence_details`; geospatial results → `export_kml`).
 
 ### SQL execute path

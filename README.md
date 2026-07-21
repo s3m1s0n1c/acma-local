@@ -9,7 +9,7 @@ The server speaks two transports: **stdio** (Claude Desktop, LM Studio local) an
 - **Local mirror** of the full RRL dataset (32 materialised tables + FTS5 narrative index), kept fresh by ACMA's `/v1/Extracts` manifest API — mobile-friendly by default (no automatic 70 MB downloads).
 - **Full-text search** (SQLite FTS5) over application narrative — answers "which licences mention 'remote operation'?" in milliseconds.
 - **Geospatial export** — site/device results carry coordinates and can be rendered as KML via `export_kml`.
-- **Spectrum plan lookup** — `get_frequency_allocation(freq_hz)` returns the AU primary allocation plus ITU Region 1/2/3 contrast rows and resolved footnote text. Data rebuilt from the 2021 ACMA Spectrum Plan PDF; seeded from `seed/spectrum_plan.sql`.
+- **Spectrum plan lookup** — `get_frequency_allocation(freq_mhz)` (or the legacy `freq_hz`) returns the AU primary allocation plus ITU Region 1/2/3 contrast rows and resolved footnote text. Data rebuilt from the 2021 ACMA Spectrum Plan PDF; seeded from `seed/spectrum_plan.sql`.
 - **Power-user SQL** — `execute_sql` runs sandboxed SELECT/WITH queries in a worker thread; `explain_query`, `describe_schema`, and `list_sample_queries` make the schema discoverable.
 - **Progressive disclosure** — `tools/list` returns terse one-liners; `describe_tool(<name>)` fetches the full markdown when needed (matterfront pattern).
 
@@ -28,6 +28,11 @@ The server speaks two transports: **stdio** (Claude Desktop, LM Studio local) an
 - `decode_emission_designator` — Decode an ITU/ACA emission designator (e.g. 16K0F3E) into structured bandwidth/modulation/info fields.
 
 Search-style results return an `_hints` array suggesting plausible follow-up tools (e.g. `search_licences` → `get_licence_details`; geospatial results → `export_kml`).
+
+Frequency tools accept explicit MHz fields as well as Hz fields. For example, use
+`{ "freq_min_mhz": 476.425, "freq_max_mhz": 477.4125 }` when the user supplies MHz;
+the MCP server performs the conversion and echoes the interpreted range. Do not mix
+`*_mhz` and `*_hz` fields in the same call.
 
 ## Installation
 

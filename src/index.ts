@@ -39,6 +39,7 @@ import { generateKml } from './kml.js';
 import { lookupFrequencyAllocation } from './spectrum_plan.js';
 import { decodeEmissionDesignator } from './emissions.js';
 import { searchDevicesByEmission } from './emissions_search.js';
+import { normalizeFrequencyPoint, normalizeFrequencyRange } from './frequency_input.js';
 import { log } from './logger.js';
 
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
@@ -148,7 +149,7 @@ Resolve a CLIENT_NO through the CLIENT_NO relationship to licence records.
 - licences_total, licences_returned, licences_truncated: explicit pagination metadata.`,
     },
     search_frequency_assignments: {
-        summary: 'Search ordinary device frequency assignments by Hz range, optionally restricted to a state. [primary]',
+        summary: 'Search ordinary device assignments using an explicit Hz or MHz range, optionally by state. [primary]',
         tags: ['primary', 'spectrum', 'geospatial-result'],
         fullDescription: `
 ### [Device Frequency Assignment Search]
@@ -156,15 +157,18 @@ Search DEVICE_DETAILS assignments, including carrier and equipment frequency ran
 
 Use this for ordinary frequency questions such as "who uses 476.625 MHz in NSW?".
 Do not substitute search_spectrum_band: that tool only covers area-wide spectrum licences.
+Pass MHz values directly in the *_mhz fields. Do not convert MHz to Hz in the chat client.
 
 ## Input
-- freq_min_hz: Exact frequency or lower range bound in Hz.
-- freq_max_hz: Optional upper bound; defaults to freq_min_hz.
+- freq_min_mhz / freq_max_mhz: Preferred when the user gives MHz, e.g. 476.425 and 477.4125.
+- freq_min_hz / freq_max_hz: Use when the user explicitly gives Hz.
+- Use one unit pair only. The upper bound is optional and defaults to the lower bound.
 - state: Optional state code, e.g. NSW.
 - limit: Default 50, max 500.
 
 ## Output
-Assignment, licence, holder, service and site/coordinate fields.`,
+The interpreted query in both Hz and MHz, returned/truncated counts, plus assignment,
+licence, holder, service and site/coordinate fields.`,
     },
     search_bsl: {
         summary: 'Search broadcasting service licences by call sign, BSL number, or on-air ID.',
@@ -181,20 +185,21 @@ Search broadcasting service licences (BSLs) by call sign, BSL number, or on-air 
 - query: CALL_SIGN, BSL_NO, or ON_AIR_ID`,
     },
     search_spectrum_band: {
-        summary: 'Find area-wide spectrum licences overlapping a frequency band (Hz); not ordinary device assignments.',
+        summary: 'Find area-wide spectrum licences overlapping an explicit Hz or MHz band; not device assignments.',
         tags: ['spectrum'],
         fullDescription: `
 ### [Spectrum Authorisation Search]
-Find licences authorised in a frequency range. Frequencies are in Hertz (Hz).
+Find licences authorised in a frequency range expressed in either Hz or MHz.
 
 ## Usage
 - Use for queries like "who's licenced between 1800 and 1900 MHz?"
-- Pass freq_min_hz and freq_max_hz; result rows overlap the requested range
+- Pass either the *_mhz pair or the *_hz pair; result rows overlap the requested range
 - Results include LICENCE_NO, AREA_NAME, frequency endpoints, CLIENT_NO
 
 ## Input
-- freq_min_hz: Lower bound of the band, in Hz (e.g. 1800000000 for 1.8 GHz)
-- freq_max_hz: Upper bound of the band, in Hz`,
+- freq_min_mhz / freq_max_mhz: Bounds in MHz (e.g. 1800 and 1900)
+- freq_min_hz / freq_max_hz: Bounds in Hz
+- Use one unit pair only`,
     },
     search_application_text: {
         summary: 'FTS5 full-text search over licence application narrative.',
@@ -325,7 +330,7 @@ Returns SQLite's EXPLAIN QUERY PLAN output for a read-only query.
 - sql: A SELECT or WITH ... SELECT statement (same restrictions as execute_sql)`,
     },
     get_frequency_allocation: {
-        summary: 'Look up ACMA Spectrum Plan allocation for a frequency (Hz). Returns AU allocation + R1/R2/R3 contrast + resolved footnotes. [capability: lookup]',
+        summary: 'Look up an ACMA Spectrum Plan allocation using explicit Hz or MHz. Returns AU + ITU regions and footnotes.',
         tags: ['lookup', 'spectrum'],
         fullDescription: `
 ### [Spectrum Allocation Lookup]
@@ -333,7 +338,8 @@ Look up the Australian Radiofrequency Spectrum Plan (ARSP) allocation for a give
 with ITU Region 1/2/3 contrast and resolved footnote text.
 
 ## Input
-- \`freq_hz\` — Positive integer or float, in Hz. Examples:
+- \`freq_mhz\` — Preferred when the user gives MHz, e.g. 87.1.
+- \`freq_hz\` — Use when the user explicitly gives Hz. Examples:
   - \`87100000\` → 87.1 MHz (FM broadcast band)
   - \`2400000000\` → 2.4 GHz (ISM band)
   - \`14000000\` → 14 MHz (amateur 20 m band)
@@ -343,6 +349,7 @@ with ITU Region 1/2/3 contrast and resolved footnote text.
 
 | Field | Type | Description |
 |-------|------|-------------|
+| \`query\` | object | Echoes the interpreted frequency in both Hz and MHz. |
 | \`match_count\` | number | Number of AU allocations covering this frequency. Normally 0 or 1; >1 indicates a plan overlap and triggers a \`_warning\`. |
 | \`allocation\` | object\|null | The AU allocation row covering the frequency, or \`null\` when nothing matches. |
 | \`regions\` | object | ITU R1/R2/R3 contrast. Keys \`"1"\`, \`"2"\`, \`"3"\`; each value is an allocation row or \`null\`. |
@@ -381,7 +388,7 @@ Each \`services[]\` element:
 
 **Call:**
 \`\`\`json
-{ "name": "get_frequency_allocation", "arguments": { "freq_hz": 87100000 } }
+{ "name": "get_frequency_allocation", "arguments": { "freq_mhz": 87.1 } }
 \`\`\`
 
 **Response (truncated):**
@@ -609,12 +616,17 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
-                        freq_min_hz: { type: 'number', description: 'Exact frequency or lower bound in Hz' },
-                        freq_max_hz: { type: 'number', description: 'Optional upper bound in Hz' },
+                        freq_min_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Preferred when the user gives MHz: exact frequency or lower bound, e.g. 476.425' },
+                        freq_max_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Optional upper bound in MHz, e.g. 477.4125' },
+                        freq_min_hz: { type: 'number', exclusiveMinimum: 0, description: 'Use only when the user explicitly gives Hz: exact frequency or lower bound' },
+                        freq_max_hz: { type: 'number', exclusiveMinimum: 0, description: 'Optional upper bound in Hz' },
                         state: { type: 'string', description: 'Optional state code, e.g. NSW' },
                         limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max rows (default 50)' },
                     },
-                    required: ['freq_min_hz'],
+                    anyOf: [
+                        { required: ['freq_min_mhz'] },
+                        { required: ['freq_min_hz'] },
+                    ],
                 },
             },
             {
@@ -635,11 +647,16 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
-                        freq_min_hz: { type: 'number', description: 'Lower bound (Hz)' },
-                        freq_max_hz: { type: 'number', description: 'Upper bound (Hz)' },
+                        freq_min_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Preferred when the user gives MHz: lower bound' },
+                        freq_max_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Upper bound in MHz' },
+                        freq_min_hz: { type: 'number', exclusiveMinimum: 0, description: 'Use only when the user explicitly gives Hz: lower bound' },
+                        freq_max_hz: { type: 'number', exclusiveMinimum: 0, description: 'Upper bound in Hz' },
                         limit:       { type: 'number', description: 'Max rows (default 20)' },
                     },
-                    required: ['freq_min_hz', 'freq_max_hz'],
+                    anyOf: [
+                        { required: ['freq_min_mhz'] },
+                        { required: ['freq_min_hz'] },
+                    ],
                 },
             },
             {
@@ -760,16 +777,25 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        freq_mhz: {
+                            type: 'number',
+                            exclusiveMinimum: 0,
+                            description: 'Preferred when the user gives MHz, e.g. 87.1.',
+                        },
                         freq_hz: {
                             type: 'number',
-                            description: 'Frequency in Hz. Examples: 87100000 (87.1 MHz), 2400000000 (2.4 GHz).',
+                            exclusiveMinimum: 0,
+                            description: 'Use only when the user explicitly gives Hz, e.g. 87100000.',
                         },
                         include_footnotes: {
                             type: 'boolean',
                             description: 'If true (default), include full footnote text.',
                         },
                     },
-                    required: ['freq_hz'],
+                    anyOf: [
+                        { required: ['freq_mhz'] },
+                        { required: ['freq_hz'] },
+                    ],
                 },
             },
             {
@@ -960,15 +986,33 @@ function createServer(): Server {
         if (name === 'search_frequency_assignments') {
             const db = openDb();
             try {
-                const min = args?.freq_min_hz as number;
-                const rows = searchFrequencyAssignments(
+                let query;
+                try {
+                    query = normalizeFrequencyRange(args ?? {});
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    return { content: [{ type: 'text', text: JSON.stringify({ _error: message }, null, 2) }], isError: true };
+                }
+                const state = args?.state as string | undefined;
+                const rawLimit = args?.limit as number | undefined;
+                const limit = Number.isFinite(rawLimit)
+                    ? Math.min(Math.max(1, Math.trunc(rawLimit!)), 500)
+                    : 50;
+                const matches = searchFrequencyAssignments(
                     db,
-                    min,
-                    (args?.freq_max_hz as number | undefined) ?? min,
-                    args?.state as string | undefined,
-                    (args?.limit as number) ?? 50
+                    query.freq_min_hz,
+                    query.freq_max_hz,
+                    state,
+                    limit + 1
                 ) as any[];
-                const envelope: any = { rows };
+                const truncated = matches.length > limit;
+                const rows = truncated ? matches.slice(0, limit) : matches;
+                const envelope: any = {
+                    query,
+                    rows,
+                    rows_returned: rows.length,
+                    rows_truncated: truncated,
+                };
                 if (rows.length > 0) {
                     const columns = Object.keys(rows[0] as object);
                     if (hasGeospatialData(columns)) {
@@ -997,10 +1041,17 @@ function createServer(): Server {
         if (name === 'search_spectrum_band') {
             const db = openDb();
             try {
+                let query;
+                try {
+                    query = normalizeFrequencyRange(args ?? {});
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    return { content: [{ type: 'text', text: JSON.stringify({ _error: message }, null, 2) }], isError: true };
+                }
                 const results = searchSpectrumBand(
                     db,
-                    args?.freq_min_hz as number,
-                    args?.freq_max_hz as number,
+                    query.freq_min_hz,
+                    query.freq_max_hz,
                     (args?.limit as number) ?? 20
                 );
                 return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
@@ -1164,11 +1215,15 @@ function createServer(): Server {
         }
 
         if (name === 'get_frequency_allocation') {
-            const freq_hz = args?.freq_hz as number;
-            const include_footnotes = args?.include_footnotes !== false;  // default true
-            if (typeof freq_hz !== 'number' || !Number.isFinite(freq_hz) || freq_hz <= 0) {
-                return { content: [{ type: 'text', text: JSON.stringify({ _error: 'freq_hz must be a positive number (Hz).' }, null, 2) }] };
+            let query;
+            try {
+                query = normalizeFrequencyPoint(args ?? {});
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                return { content: [{ type: 'text', text: JSON.stringify({ _error: message }, null, 2) }], isError: true };
             }
+            const freq_hz = query.freq_hz;
+            const include_footnotes = args?.include_footnotes !== false;  // default true
             const db = openDb();
             try {
                 const tableCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
@@ -1176,6 +1231,7 @@ function createServer(): Server {
                     return { content: [{ type: 'text', text: JSON.stringify({ _error: "Spectrum plan data not loaded. Run 'npm run import-spectrum-plan -- --reseed'." }, null, 2) }] };
                 }
                 const result: any = lookupFrequencyAllocation(db, freq_hz, include_footnotes);
+                result.query = query;
 
                 // Staleness warning
                 const warnings: string[] = [];

@@ -249,6 +249,8 @@ export function searchFrequencyAssignments(
   const min = Math.min(freqMinHz, freqMaxHz);
   const max = Math.max(freqMinHz, freqMaxHz);
   const normalizedState = state?.trim().toUpperCase() ?? '';
+  // Permit one internal look-ahead row so the MCP handler can report whether
+  // the public 500-row maximum truncated the result without a second full scan.
   return db.prepare(`
     SELECT d.SDD_ID, d.LICENCE_NO, d.DEVICE_REGISTRATION_IDENTIFIER,
            d.FREQUENCY, d.CARRIER_FREQ, d.BANDWIDTH, d.EMISSION,
@@ -275,7 +277,7 @@ export function searchFrequencyAssignments(
       AND (@state = '' OR UPPER(s.STATE) = @state)
     ORDER BY d.FREQUENCY, d.LICENCE_NO, d.SDD_ID
     LIMIT @limit
-  `).all({ min, max, state: normalizedState, limit: clampLimit(limit, 50) });
+  `).all({ min, max, state: normalizedState, limit: clampLimit(limit, 50, MAX_SEARCH_RESULTS + 1) });
 }
 
 export function searchSpectrumBand(
