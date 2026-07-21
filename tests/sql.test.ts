@@ -17,7 +17,8 @@ describe('executeSql', () => {
     let db: Database.Database;
 
     beforeAll(() => {
-        if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir);
+        if (fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true });
+        fs.mkdirSync(scratchDir);
         initializeDatabase(dbPath);
         db = new Database(dbPath);
         db.prepare("INSERT INTO site (SITE_ID, NAME, POSTCODE, STATE) VALUES ('S1', 'Sydney Tower', '2000', 'NSW')").run();
@@ -300,4 +301,3 @@ describe('explainQuery', () => {
         db.close();
     });
 });
-

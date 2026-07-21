@@ -3,6 +3,7 @@
  *
  * Per-session StreamableHTTPServerTransport (official MCP multi-client pattern).
  * Full tool catalog: search_sites, search_licences, search_clients,
+ *                    get_client_details, search_frequency_assignments,
  *                    get_licence_details, get_site_details, sync_data,
  *                    execute_sql, list_sample_queries, export_kml,
  *                    search_bsl, search_spectrum_band, search_application_text,
@@ -25,8 +26,10 @@ import {
     searchSites,
     searchLicences,
     searchClients,
+    getClientDetails,
     getLicenceDetails,
     getSiteDetails,
+    searchFrequencyAssignments,
     searchBsl,
     searchSpectrumBand,
     searchApplicationText,
@@ -51,21 +54,21 @@ interface ToolDoc {
 
 export const TOOL_DOCS: Record<string, ToolDoc> = {
     search_licences: {
-        summary: 'Search ACMA licences by licence number (substring match). [primary]',
+        summary: 'Search licences by number, holder name, client number, ABN or ACN. [primary]',
         tags: ['primary', 'sql'],
         fullDescription: `
 ### [Licence Search] PRIMARY SEARCH TOOL
-Search ACMA RRL licences by licence number.
+Search ACMA RRL licences by licence number or holder identity.
 
 ## Usage
-- Use this first when given a licence number (e.g. "1191324/1", "1191324")
-- Results include: LICENCE_NO, STATUS, LICENCE_TYPE_NAME, CLIENT_NO, DATE_OF_EXPIRY
+- Accepts a licence number, client number, licencee/trading name, ABN or ACN.
+- Results include resolved service, subservice, status and holder fields.
 
 ## Input
-- query: Licence number or partial number`,
+- query: Licence number or holder identity`,
     },
     get_licence_details: {
-        summary: 'Full licence record: holder + up to 50 devices with site coordinates.',
+        summary: 'Full licence: holder, devices, sites, antenna/area lookups, BSL, spectrum and text links.',
         tags: ['lookup', 'geospatial-result'],
         fullDescription: `
 ### [Licence Details]
@@ -73,14 +76,17 @@ Get full details for a specific licence: client info and all associated radio de
 
 ## Usage
 - Use after finding a licence number via search_licences
-- Returns: licence record, client/owner info, up to 50 device records (with site coordinates)
+- Returns the holder, up to device_limit devices, truncation metadata, BSL details,
+  spectrum authorisations and application-text references.
+- Device rows resolve site, antenna, service, station and satellite relationships.
 - If results contain geospatial data, a result_id is returned for optional KML export via export_kml
 
 ## Input
-- licence_no: Exact licence number (e.g. "1191324/1")`,
+- licence_no: Exact licence number (e.g. "1191324/1")
+- device_limit: Maximum device rows (default 50, max 500)`,
     },
     search_sites: {
-        summary: 'Search transmission sites by name or postcode.',
+        summary: 'Search sites by ID, name, postcode or state; includes coordinates and device counts.',
         tags: ['lookup', 'geospatial-result'],
         fullDescription: `
 ### [Site Search]
@@ -95,7 +101,7 @@ Search transmission sites by site name or postcode.
 - query: Site name or postcode`,
     },
     get_site_details: {
-        summary: 'Full site record + up to 50 devices registered there.',
+        summary: 'Full site + related devices, holders, licences, services and antennas.',
         tags: ['lookup', 'geospatial-result'],
         fullDescription: `
 ### [Site Details]
@@ -103,25 +109,62 @@ Get full details for a specific site including all devices registered at that si
 
 ## Usage
 - Use after finding a SITE_ID via search_sites
-- Returns: site record, up to 50 associated device_details records
+- Returns: site record, up to device_limit associated device_details records
 - A result_id is returned for optional KML export via export_kml
 
 ## Input
-- site_id: Exact Site ID from site search results`,
+- site_id: Exact Site ID from site search results
+- device_limit: Maximum device rows (default 50, max 500)`,
     },
     search_clients: {
-        summary: 'Search licence holders (clients) by company name or trading name.',
+        summary: 'Search clients by name, ID, ABN/ACN or any postal-address field. [primary]',
         tags: ['lookup'],
         fullDescription: `
 ### [Client / Licensee Search]
-Search for licence holders (clients) by company name or trading name.
+Search licence holders using all identity and postal-address fields.
 
 ## Usage
-- Use when asked about who holds licences, e.g. "who operates on this frequency?"
-- Results include: CLIENT_NO, LICENCEE, TRADING_NAME, ABN, ACN, STATE
+- Use for people/business names, client number, ABN, ACN, street, suburb, state or postcode.
+- Results contain the complete postal address and a LICENCE_COUNT.
+- Follow the returned get_client_details hint to list that client's licences.
 
 ## Input
-- query: Business name or trading name`,
+- query: Name, client number, ABN/ACN or address text`,
+    },
+    get_client_details: {
+        summary: 'Get one client/holder with postal address and up to 500 related licences.',
+        tags: ['lookup'],
+        fullDescription: `
+### [Client Details]
+Resolve a CLIENT_NO through the CLIENT_NO relationship to licence records.
+
+## Input
+- client_no: Exact numeric client ID from search_clients.
+- licence_limit: Maximum related licences (default 50, max 500).
+
+## Output
+- client: full holder and postal-address record with resolved client type, fee status and industry.
+- licences: related licence records with resolved service/subservice/status.
+- licences_total, licences_returned, licences_truncated: explicit pagination metadata.`,
+    },
+    search_frequency_assignments: {
+        summary: 'Search ordinary device frequency assignments by Hz range, optionally restricted to a state. [primary]',
+        tags: ['primary', 'spectrum', 'geospatial-result'],
+        fullDescription: `
+### [Device Frequency Assignment Search]
+Search DEVICE_DETAILS assignments, including carrier and equipment frequency ranges.
+
+Use this for ordinary frequency questions such as "who uses 476.625 MHz in NSW?".
+Do not substitute search_spectrum_band: that tool only covers area-wide spectrum licences.
+
+## Input
+- freq_min_hz: Exact frequency or lower range bound in Hz.
+- freq_max_hz: Optional upper bound; defaults to freq_min_hz.
+- state: Optional state code, e.g. NSW.
+- limit: Default 50, max 500.
+
+## Output
+Assignment, licence, holder, service and site/coordinate fields.`,
     },
     search_bsl: {
         summary: 'Search broadcasting service licences by call sign, BSL number, or on-air ID.',
@@ -138,7 +181,7 @@ Search broadcasting service licences (BSLs) by call sign, BSL number, or on-air 
 - query: CALL_SIGN, BSL_NO, or ON_AIR_ID`,
     },
     search_spectrum_band: {
-        summary: 'Find licences authorised in a frequency band (Hz).',
+        summary: 'Find area-wide spectrum licences overlapping a frequency band (Hz); not ordinary device assignments.',
         tags: ['spectrum'],
         fullDescription: `
 ### [Spectrum Authorisation Search]
@@ -494,7 +537,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
-                        query: { type: 'string', description: 'Licence number or partial number, e.g. "1191324"' },
+                        query: { type: 'string', description: 'Licence number, holder name, client number, ABN or ACN' },
                         limit: { type: 'number', description: 'Max results (default 10)' },
                     },
                     required: ['query'],
@@ -507,6 +550,7 @@ function createServer(): Server {
                     type: 'object',
                     properties: {
                         licence_no: { type: 'string', description: 'Exact licence number, e.g. "1191324/1"' },
+                        device_limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max devices (default 50)' },
                     },
                     required: ['licence_no'],
                 },
@@ -530,6 +574,7 @@ function createServer(): Server {
                     type: 'object',
                     properties: {
                         site_id: { type: 'string', description: 'Site ID, e.g. "124"' },
+                        device_limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max devices (default 50)' },
                     },
                     required: ['site_id'],
                 },
@@ -540,10 +585,36 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
-                        query: { type: 'string', description: 'Licensee or trading name' },
+                        query: { type: 'string', description: 'Name, client number, ABN/ACN, street, suburb, state or postcode' },
                         limit: { type: 'number', description: 'Max results (default 10)' },
                     },
                     required: ['query'],
+                },
+            },
+            {
+                name: 'get_client_details',
+                description: TOOL_DOCS.get_client_details!.summary,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        client_no: { type: 'integer', description: 'Exact CLIENT_NO from search_clients' },
+                        licence_limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max licences (default 50)' },
+                    },
+                    required: ['client_no'],
+                },
+            },
+            {
+                name: 'search_frequency_assignments',
+                description: TOOL_DOCS.search_frequency_assignments!.summary,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        freq_min_hz: { type: 'number', description: 'Exact frequency or lower bound in Hz' },
+                        freq_max_hz: { type: 'number', description: 'Optional upper bound in Hz' },
+                        state: { type: 'string', description: 'Optional state code, e.g. NSW' },
+                        limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max rows (default 50)' },
+                    },
+                    required: ['freq_min_hz'],
                 },
             },
             {
@@ -758,7 +829,11 @@ function createServer(): Server {
         if (name === 'get_licence_details') {
             const db = openDb();
             try {
-                const result = getLicenceDetails(db, args?.licence_no as string);
+                const result = getLicenceDetails(
+                    db,
+                    args?.licence_no as string,
+                    (args?.device_limit as number) ?? 50
+                );
                 if (!result) return { content: [{ type: 'text', text: `No licence found for: ${args?.licence_no}` }] };
 
                 // Cache devices for potential KML export (devices now include site coords)
@@ -816,7 +891,11 @@ function createServer(): Server {
         if (name === 'get_site_details') {
             const db = openDb();
             try {
-                const result = getSiteDetails(db, args?.site_id as string);
+                const result = getSiteDetails(
+                    db,
+                    args?.site_id as string,
+                    (args?.device_limit as number) ?? 50
+                );
                 if (!result) return { content: [{ type: 'text', text: `No site found for ID: ${args?.site_id}` }] };
 
                 // Cache site record for potential KML export
@@ -844,8 +923,66 @@ function createServer(): Server {
         if (name === 'search_clients') {
             const db = openDb();
             try {
-                const results = searchClients(db, args?.query as string, (args?.limit as number) ?? 10);
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+                const rows = searchClients(db, args?.query as string, (args?.limit as number) ?? 10) as any[];
+                const envelope: any = { rows };
+                if (rows.length > 0 && rows[0]?.CLIENT_NO != null) {
+                    envelope._hints = [{
+                        tool: 'get_client_details',
+                        args: { client_no: rows[0].CLIENT_NO },
+                        why: 'licences held by the first matching client',
+                    }];
+                }
+                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
+            } finally { if (db.open) db.close(); }
+        }
+
+        if (name === 'get_client_details') {
+            const db = openDb();
+            try {
+                const result = getClientDetails(
+                    db,
+                    args?.client_no as number,
+                    (args?.licence_limit as number) ?? 50
+                );
+                if (!result) return { content: [{ type: 'text', text: `No client found for ID: ${args?.client_no}` }] };
+                const response: any = { ...result };
+                if (result.licences.length > 0 && (result.licences[0] as any).LICENCE_NO) {
+                    response._hints = [{
+                        tool: 'get_licence_details',
+                        args: { licence_no: (result.licences[0] as any).LICENCE_NO },
+                        why: 'devices and authorisations for the first licence',
+                    }];
+                }
+                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+            } finally { if (db.open) db.close(); }
+        }
+
+        if (name === 'search_frequency_assignments') {
+            const db = openDb();
+            try {
+                const min = args?.freq_min_hz as number;
+                const rows = searchFrequencyAssignments(
+                    db,
+                    min,
+                    (args?.freq_max_hz as number | undefined) ?? min,
+                    args?.state as string | undefined,
+                    (args?.limit as number) ?? 50
+                ) as any[];
+                const envelope: any = { rows };
+                if (rows.length > 0) {
+                    const columns = Object.keys(rows[0] as object);
+                    if (hasGeospatialData(columns)) {
+                        envelope.result_id = cacheResult(columns, rows.map(r => columns.map(c => r[c])));
+                    }
+                    if (rows[0]?.LICENCE_NO) {
+                        envelope._hints = [{
+                            tool: 'get_licence_details',
+                            args: { licence_no: rows[0].LICENCE_NO },
+                            why: 'full details for the first matching assignment',
+                        }];
+                    }
+                }
+                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
             } finally { if (db.open) db.close(); }
         }
 

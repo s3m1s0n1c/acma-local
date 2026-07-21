@@ -3,10 +3,12 @@ import {
     getSiteDetails,
     searchLicences,
     searchClients,
+    getClientDetails,
     getLicenceDetails,
     searchBsl,
     searchSpectrumBand,
     searchApplicationText,
+    searchFrequencyAssignments,
 } from '../src/logic.js';
 import { initializeDatabase } from '../src/db.js';
 import Database from 'better-sqlite3';
@@ -30,8 +32,10 @@ describe('Logic Layer', () => {
         db = new Database(dbPath);
 
         // Seed data
-        db.prepare("INSERT INTO site (SITE_ID, NAME, POSTCODE) VALUES ('S1', 'Sydney Tower', '2000')").run();
-        db.prepare("INSERT INTO client (CLIENT_NO, LICENCEE) VALUES (1, 'Test Client')").run();
+        db.prepare("INSERT INTO site (SITE_ID, NAME, STATE, POSTCODE) VALUES ('S1', 'Sydney Tower', 'NSW', '2000')").run();
+        db.prepare(`INSERT INTO client
+            (CLIENT_NO, LICENCEE, ABN, POSTAL_STREET, POSTAL_SUBURB, POSTAL_STATE, POSTAL_POSTCODE)
+            VALUES (1, 'Test Client', '12345678901', '5 Example Road', 'Gosford', 'NSW', '2250')`).run();
         db.prepare("INSERT INTO licence (LICENCE_NO, CLIENT_NO) VALUES ('L1', 1)").run();
         db.prepare("INSERT INTO device_details (SDD_ID, SITE_ID, LICENCE_NO, FREQUENCY) VALUES (101, 'S1', 'L1', 100000000)").run();
     });
@@ -65,6 +69,26 @@ describe('Logic Layer', () => {
     test('searchClients should find client by name', () => {
         const results = searchClients(db, 'Test');
         expect(results).toHaveLength(1);
+    });
+
+    test('searchClients searches identity and postal address fields', () => {
+        for (const query of ['1', '12345678901', 'Example Road', 'Gosford', '2250']) {
+            const results = searchClients(db, query) as any[];
+            expect(results.map(r => r.CLIENT_NO)).toContain(1);
+        }
+    });
+
+    test('searchLicences can find licences by holder name and ABN', () => {
+        expect((searchLicences(db, 'Test Client') as any[])[0]?.LICENCE_NO).toBe('L1');
+        expect((searchLicences(db, '12345678901') as any[])[0]?.LICENCE_NO).toBe('L1');
+    });
+
+    test('getClientDetails follows CLIENT_NO to related licences', () => {
+        const result = getClientDetails(db, 1) as any;
+        expect(result.client.POSTAL_SUBURB).toBe('Gosford');
+        expect(result.licences.map((l: any) => l.LICENCE_NO)).toContain('L1');
+        expect(result.licences_total).toBeGreaterThanOrEqual(1);
+        expect(result.licences_truncated).toBe(false);
     });
 
     test('getLicenceDetails should return licence, client and devices', () => {
@@ -212,6 +236,38 @@ describe('Logic Layer', () => {
         db2.close();
         expect(details).not.toBeNull();
         expect(details.devices[0]).toMatchObject({ SDD_ID: 5001, SA_ID: 1003, SATELLITE_NAME: 'USASAT-14K' });
+    });
+
+    test('device details resolve the antenna relationship', () => {
+        const writeDb = new Database(dbPath);
+        writeDb.exec(`
+            INSERT INTO antenna (ANTENNA_ID, MANUFACTURER, MODEL, ANTENNA_TYPE)
+                VALUES ('ANT-1', 'Acme', 'Beam 4', 'Yagi');
+            UPDATE device_details
+               SET ANTENNA_ID = 'ANT-1'
+             WHERE SDD_ID = 101;
+        `);
+        writeDb.close();
+
+        const readDb = new Database(dbPath, { readonly: true });
+        const result = getLicenceDetails(readDb, 'L1') as any;
+        readDb.close();
+        expect(result.devices[0]).toMatchObject({
+            ANTENNA_MANUFACTURER: 'Acme',
+            ANTENNA_MODEL: 'Beam 4',
+        });
+    });
+
+    test('searchFrequencyAssignments resolves licence, holder and site', () => {
+        const results = searchFrequencyAssignments(db, 99_999_000, 100_001_000, 'NSW', 10) as any[];
+        expect(results).toHaveLength(1);
+        expect(results[0]).toMatchObject({
+            SDD_ID: 101,
+            LICENCE_NO: 'L1',
+            LICENCEE: 'Test Client',
+            SITE_NAME: 'Sydney Tower',
+            STATE: 'NSW',
+        });
     });
 
     test('searchSpectrumBand handles rows with NULL UP_FREQUENCY_END', () => {
