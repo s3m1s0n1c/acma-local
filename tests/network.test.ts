@@ -97,7 +97,8 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
             freq_max_hz: 477412500,
         });
         expect(parsed.rows).toHaveLength(2);
-        expect(parsed.rows[0]).toMatchObject({ LICENCE_NO: 'MHZ-1', FREQUENCY: 476625000 });
+        const first = Object.fromEntries(parsed.columns.map((column: string, i: number) => [column, parsed.rows[0][i]]));
+        expect(first).toMatchObject({ LICENCE_NO: 'MHZ-1', FREQUENCY: 476625000 });
         expect(parsed.rows_returned).toBe(2);
         expect(parsed.rows_truncated).toBe(false);
 
@@ -257,7 +258,7 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         await transport.close();
     }, 15000);
 
-    test('tools/list advertises the full 20-tool catalog', async () => {
+    test('tools/list advertises the full 21-tool catalog', async () => {
         const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
         const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
         await client.connect(transport);
@@ -270,7 +271,8 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         expect(tools.tools.some(t => t.name === 'search_devices_by_emission')).toBe(true);
         expect(tools.tools.some(t => t.name === 'get_client_details')).toBe(true);
         expect(tools.tools.some(t => t.name === 'search_frequency_assignments')).toBe(true);
-        expect(tools.tools.length).toBe(20);
+        expect(tools.tools.some(t => t.name === 'get_result_page')).toBe(true);
+        expect(tools.tools.length).toBe(21);
 
         await transport.close();
     }, 15000);
@@ -286,20 +288,21 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         return result.content[0].text as string;
     }
 
-    test('search_licences result includes _hints pointing at get_licence_details', async () => {
+    function expandRows(payload: any): any[] {
+        return payload.rows.map((row: unknown[]) =>
+            Object.fromEntries(payload.columns.map((column: string, i: number) => [column, row[i]]))
+        );
+    }
+
+    test('search results omit _hints unless explicitly requested', async () => {
         const response = await callMcpTool('search_licences', { query: '1', limit: 1 });
         const parsed = JSON.parse(response);
-        // Response is now an envelope: { rows, _hints? }
         expect(Array.isArray(parsed.rows)).toBe(true);
-        if (parsed.rows.length > 0) {
-            expect(parsed._hints).toBeDefined();
-            expect(parsed._hints[0].tool).toBe('get_licence_details');
-            expect(parsed._hints[0].args).toHaveProperty('licence_no');
-        }
+        expect(parsed._hints).toBeUndefined();
     }, 15000);
 
-    test('search_sites result includes _hints pointing at get_site_details', async () => {
-        const response = await callMcpTool('search_sites', { query: '2000', limit: 1 });
+    test('include_hints=true returns optional follow-up suggestions', async () => {
+        const response = await callMcpTool('search_sites', { query: '2000', limit: 2, include_hints: true });
         const parsed = JSON.parse(response);
         expect(Array.isArray(parsed.rows)).toBe(true);
         if (parsed.rows.length > 0) {
@@ -308,14 +311,36 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         }
     }, 15000);
 
-    test('search_clients result has no _hints (no follow-up tool)', async () => {
+    test('search_clients also keeps hints off by default', async () => {
         const response = await callMcpTool('search_clients', { query: 'Test', limit: 1 });
         const parsed = JSON.parse(response);
-        // search_clients still returns a flat array OR an envelope without _hints.
-        // Either acceptable — but no _hints field should be present.
-        if (parsed._hints !== undefined) {
-            throw new Error('search_clients should not emit _hints');
-        }
+        expect(parsed._hints).toBeUndefined();
+    }, 15000);
+
+    test('cached results are pageable and identical calls are deduplicated', async () => {
+        const first = JSON.parse(await callMcpTool('search_frequency_assignments', {
+            freq_min_mhz: 476.425,
+            freq_max_mhz: 477.4125,
+            limit: 2,
+            page_size: 1,
+        }));
+        expect(first.rows).toHaveLength(1);
+        expect(first.has_more).toBe(true);
+
+        const page = JSON.parse(await callMcpTool('get_result_page', {
+            result_id: first.result_id,
+            offset: 1,
+            limit: 1,
+        }));
+        expect(page.rows).toHaveLength(1);
+        expect(page.has_more).toBe(false);
+
+        const duplicate = JSON.parse(await callMcpTool('search_frequency_assignments', {
+            freq_min_mhz: 476.425,
+            freq_max_mhz: 477.4125,
+            limit: 2,
+        }));
+        expect(duplicate).toMatchObject({ duplicate: true, result_id: first.result_id });
     }, 15000);
 
     // ─── End _hints tests ──────────────────────────────────────────────────────
@@ -361,7 +386,7 @@ COMMIT;
             applyReseed(seedDb, fixture);
         } finally { seedDb.close(); }
 
-        const response = await callMcpTool('get_frequency_allocation', { freq_hz: 87100000 });
+        const response = await callMcpTool('get_frequency_allocation', { freq_hz: 87100000, include_hints: true });
         const parsed = JSON.parse(response);
         expect(parsed.match_count).toBe(1);
         // New shape: allocation (singular object) instead of allocations[0]
@@ -402,7 +427,7 @@ COMMIT;
         const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
         const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
         await client.connect(transport);
-        const res = await client.callTool({ name: 'decode_emission_designator', arguments: { code: '16K0F3E' } });
+        const res = await client.callTool({ name: 'decode_emission_designator', arguments: { code: '16K0F3E', include_hints: true } });
         const payload = JSON.parse((res.content as any)[0].text);
         expect(payload.valid).toBe(true);
         expect(payload.bandwidth.value_hz).toBe(16000);
@@ -437,12 +462,13 @@ COMMIT;
         const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
         const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
         await client.connect(transport);
-        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'F', info_type: 'E' } });
+        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'F', info_type: 'E', include_hints: true } });
         const payload = JSON.parse((res.content as any)[0].text);
         expect(payload._error).toBeUndefined();
         expect(payload.rows.length).toBeGreaterThanOrEqual(1);
-        expect(payload.rows[0].decoded.modulation_code).toBe('F');
-        expect(payload.rows[0].decoded.info_type_description).toContain('Telephony');
+        const rows = expandRows(payload);
+        expect(rows[0].decoded.modulation_code).toBe('F');
+        expect(rows[0].decoded.info_type_description).toContain('Telephony');
         expect(payload.resolved_filters.modulation.code).toBe('F');
         expect(payload._hints?.length).toBeGreaterThan(0);
         expect(payload._hints.some((h: any) => h.tool === 'decode_emission_designator' && h.args?.code)).toBe(true);
@@ -501,7 +527,7 @@ COMMIT;
             'search_licences', 'get_licence_details', 'search_sites', 'get_site_details',
             'search_clients', 'search_bsl', 'search_spectrum_band', 'search_application_text',
             'get_frequency_allocation', 'sync_data', 'list_sample_queries', 'execute_sql',
-            'export_kml', 'describe_schema', 'describe_tool', 'explain_query',
+            'export_kml', 'get_result_page', 'describe_schema', 'describe_tool', 'explain_query',
             'decode_emission_designator', 'search_devices_by_emission',
         ];
         for (const name of advertised) {

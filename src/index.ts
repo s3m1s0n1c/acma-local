@@ -9,7 +9,7 @@
  *                    search_bsl, search_spectrum_band, search_application_text,
  *                    describe_schema, describe_tool, explain_query,
  *                    get_frequency_allocation, decode_emission_designator,
- *                    search_devices_by_emission.
+ *                    search_devices_by_emission, get_result_page.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -40,6 +40,7 @@ import { lookupFrequencyAllocation } from './spectrum_plan.js';
 import { decodeEmissionDesignator } from './emissions.js';
 import { searchDevicesByEmission } from './emissions_search.js';
 import { normalizeFrequencyPoint, normalizeFrequencyRange } from './frequency_input.js';
+import { ResultCache, objectRowsToColumnar } from './result_cache.js';
 import { log } from './logger.js';
 
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
@@ -356,7 +357,7 @@ with ITU Region 1/2/3 contrast and resolved footnote text.
 | \`resolved_footnotes\` | object | Flat map of \`footnote_ref → footnote_text\` covering all refs in \`allocation\` + all \`regions\`. Omitted when \`include_footnotes=false\`. |
 | \`source\` | object | \`{ published_date, last_patch_date }\` — provenance from \`spectrum_plan_meta\`. |
 | \`_warning\` | string | Staleness or integrity notice. Present when base data is ≥ 3 years old, no match found, or >1 overlapping rows detected. Absent otherwise. |
-| \`_hints\` | array | Cross-link suggestions. Present when \`match_count > 0\`. |
+| \`_hints\` | array | Optional cross-link suggestions. Present only when \`include_hints: true\`. |
 
 ### Allocation / region row fields
 
@@ -445,7 +446,7 @@ Decode an ITU/ACA emission designator (the 7- or 9-character code stored in \`de
 ## Output
 - valid: true if bandwidth parsed AND all three required body codes are known. Optional codes are recorded as warnings, not errors.
 - warnings[]: non-fatal observations (whitespace, unknown optional codes, length mismatch).
-- _hints: includes a search_devices_by_emission call with the parsed modulation + info_type prefilled, so finding every device matching the same emission is one click away.
+- _hints: when \`include_hints: true\`, includes a prefilled search_devices_by_emission call.
 
 ## Notes
 - The decoder is the inverse of search_devices_by_emission: one designator → many fields; use search_devices_by_emission to go the other way (one filter → many devices).
@@ -478,11 +479,25 @@ Find device_details rows whose EMISSION designator matches one or more decoded d
 ## Output
 - rows[]: each row carries LICENCE_NO, CLIENT_NO, FREQUENCY, EMISSION, decoded summary (modulation/info-type descriptions, parsed bandwidth), SITE_ID, STATE, and transmitter power.
 - resolved_filters: echoes back the codes the handler actually matched on — useful when you passed a description.
-- _hints: links to get_licence_details for the first row, decode_emission_designator for full breakdowns, and execute_sql for aggregation.
+- _hints: optional links returned only when \`include_hints: true\`.
 
 ## Notes
 - Description-only resolution is the common case; you don't need to memorise that R = SSB-reduced-carrier or C = facsimile.
 - For aggregate questions ("most common modulation across all devices"), use execute_sql with SUBSTR + emission_modulation join — see list_sample_queries.`,
+    },
+    get_result_page: {
+        summary: 'Read another page from a cached search result without repeating the database query.',
+        tags: ['meta'],
+        fullDescription: `
+### [Cached Result Page]
+Return a compact columnar page from a previous search result.
+
+## Input
+- result_id: ID returned by a search tool.
+- offset: Zero-based row offset (default 0).
+- limit: Page size (default 25, max 100).
+
+Cached results expire after 30 minutes.`,
     },
 };
 
@@ -490,27 +505,56 @@ Find device_details rows whose EMISSION designator matches one or more decoded d
 // Caches query results (columns + rows) so KML can be generated on demand
 // without re-running the query. 30-minute TTL.
 
-interface CachedResult {
-    columns: string[];
-    rows: unknown[][];
-    expires: number;
-}
-
-const resultCache = new Map<string, CachedResult>();
+const resultCache = new ResultCache();
 
 function cacheResult(columns: string[], rows: unknown[][]): string {
-    const id = randomUUID();
-    resultCache.set(id, { columns, rows, expires: Date.now() + 30 * 60 * 1000 });
-    return id;
+    return resultCache.putAnonymous(columns, rows).id;
 }
 
 // Cleanup expired results every 5 mins
 setInterval(() => {
-    const now = Date.now();
-    for (const [id, entry] of resultCache.entries()) {
-        if (now > entry.expires) resultCache.delete(id);
-    }
+    resultCache.cleanup();
 }, 300_000).unref();
+
+function pagedSearchResponse(
+    tool: string,
+    args: Record<string, unknown>,
+    objectRows: Array<Record<string, unknown>>,
+    extra: Record<string, unknown> = {},
+    hints?: unknown[]
+): Record<string, unknown> {
+    const { columns, rows } = objectRowsToColumnar(objectRows);
+    return pagedColumnarResponse(tool, args, columns, rows, extra, hints);
+}
+
+function pagedColumnarResponse(
+    tool: string,
+    args: Record<string, unknown>,
+    columns: string[],
+    rows: unknown[][],
+    extra: Record<string, unknown> = {},
+    hints?: unknown[]
+): Record<string, unknown> {
+    const { entry, duplicate } = resultCache.put(tool, args, columns, rows);
+    if (duplicate) {
+        return {
+            duplicate: true,
+            result_id: entry.id,
+            total: entry.rows.length,
+            message: 'Identical result already returned. Use get_result_page if another page is needed.',
+        };
+    }
+    const page = resultCache.page(
+        entry.id,
+        (args['offset'] as number | undefined) ?? 0,
+        (args['page_size'] as number | undefined) ?? 25
+    )!;
+    return {
+        ...page,
+        ...extra,
+        ...(args['include_hints'] === true && hints?.length ? { _hints: hints } : {}),
+    };
+}
 
 /**
  * Detects whether a result set contains geospatial data (lat/lng or geometry columns).
@@ -528,6 +572,33 @@ function openDb() {
     return new Database(dbPath, { readonly: true });
 }
 
+const HINT_OPTION = {
+    include_hints: {
+        type: 'boolean',
+        description: 'Return optional follow-up suggestions. Default false to avoid automatic tool chains.',
+    },
+} as const;
+
+const PAGED_RESPONSE_OPTIONS = {
+    ...HINT_OPTION,
+    page_size: {
+        type: 'integer', minimum: 1, maximum: 100,
+        description: 'Rows delivered in this response (default 25). The complete result remains cached.',
+    },
+    offset: {
+        type: 'integer', minimum: 0,
+        description: 'Initial zero-based result offset (default 0).',
+    },
+} as const;
+
+const DB_TOOLS = new Set([
+    'search_licences', 'get_licence_details', 'search_sites', 'get_site_details',
+    'search_clients', 'get_client_details', 'search_frequency_assignments',
+    'search_bsl', 'search_spectrum_band', 'search_application_text',
+    'describe_schema', 'explain_query', 'execute_sql', 'get_frequency_allocation',
+    'search_devices_by_emission',
+]);
+
 function createServer(): Server {
     const server = new Server(
         { name: 'acma-rrl-server', version: '1.10.0' },
@@ -544,6 +615,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         query: { type: 'string', description: 'Licence number, holder name, client number, ABN or ACN' },
                         limit: { type: 'number', description: 'Max results (default 10)' },
                     },
@@ -556,6 +628,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...HINT_OPTION,
                         licence_no: { type: 'string', description: 'Exact licence number, e.g. "1191324/1"' },
                         device_limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max devices (default 50)' },
                     },
@@ -568,6 +641,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         query: { type: 'string', description: 'Site name or postcode' },
                         limit: { type: 'number', description: 'Max results (default 10)' },
                     },
@@ -580,6 +654,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...HINT_OPTION,
                         site_id: { type: 'string', description: 'Site ID, e.g. "124"' },
                         device_limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max devices (default 50)' },
                     },
@@ -592,6 +667,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         query: { type: 'string', description: 'Name, client number, ABN/ACN, street, suburb, state or postcode' },
                         limit: { type: 'number', description: 'Max results (default 10)' },
                     },
@@ -604,6 +680,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...HINT_OPTION,
                         client_no: { type: 'integer', description: 'Exact CLIENT_NO from search_clients' },
                         licence_limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max licences (default 50)' },
                     },
@@ -616,6 +693,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         freq_min_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Preferred when the user gives MHz: exact frequency or lower bound, e.g. 476.425' },
                         freq_max_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Optional upper bound in MHz, e.g. 477.4125' },
                         freq_min_hz: { type: 'number', exclusiveMinimum: 0, description: 'Use only when the user explicitly gives Hz: exact frequency or lower bound' },
@@ -635,6 +713,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         query: { type: 'string', description: 'CALL_SIGN, BSL_NO, or ON_AIR_ID' },
                         limit: { type: 'number', description: 'Max rows (default 10)' },
                     },
@@ -647,6 +726,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         freq_min_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Preferred when the user gives MHz: lower bound' },
                         freq_max_mhz: { type: 'number', exclusiveMinimum: 0, description: 'Upper bound in MHz' },
                         freq_min_hz: { type: 'number', exclusiveMinimum: 0, description: 'Use only when the user explicitly gives Hz: lower bound' },
@@ -665,6 +745,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         query: { type: 'string', description: 'FTS5 query string' },
                         limit: { type: 'number', description: 'Max rows (default 20)' },
                     },
@@ -737,6 +818,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         sql: {
                             type: 'string',
                             description: 'A SELECT SQL query to run against the ACMA RRL database',
@@ -761,6 +843,19 @@ function createServer(): Server {
                 },
             },
             {
+                name: 'get_result_page',
+                description: TOOL_DOCS.get_result_page!.summary,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        result_id: { type: 'string', description: 'Cached result_id returned by a search tool' },
+                        offset: { type: 'integer', minimum: 0, description: 'Zero-based row offset (default 0)' },
+                        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Rows to return (default 25)' },
+                    },
+                    required: ['result_id'],
+                },
+            },
+            {
                 name: 'describe_tool',
                 description: TOOL_DOCS.describe_tool!.summary,
                 inputSchema: {
@@ -777,6 +872,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...HINT_OPTION,
                         freq_mhz: {
                             type: 'number',
                             exclusiveMinimum: 0,
@@ -804,6 +900,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...HINT_OPTION,
                         code: { type: 'string', description: 'Emission designator, e.g. 16K0F3E or 10M0W7D' },
                     },
                     required: ['code'],
@@ -815,6 +912,7 @@ function createServer(): Server {
                 inputSchema: {
                     type: 'object',
                     properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
                         modulation:       { type: 'string', description: "Code letter (e.g. 'R', 'F') or description substring (e.g. 'reduced', 'frequency modulation')" },
                         signal_nature:    { type: 'string', description: "Code digit (e.g. '3') or description substring" },
                         info_type:        { type: 'string', description: "Code letter (e.g. 'C', 'E') or description substring (e.g. 'facsimile', 'telephony')" },
@@ -835,20 +933,22 @@ function createServer(): Server {
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { name, arguments: args } = request.params;
+        const started = performance.now();
+        let completed: any;
+        try {
+            completed = await (async () => {
 
         if (name === 'search_licences') {
             const db = openDb();
             try {
                 const rows = searchLicences(db, args?.query as string, (args?.limit as number) ?? 10) as any[];
-                const envelope: any = { rows };
-                if (rows.length > 0 && rows[0]?.LICENCE_NO) {
-                    envelope._hints = [{
+                const hints = rows.length > 0 && rows[0]?.LICENCE_NO ? [{
                         tool: 'get_licence_details',
                         args: { licence_no: rows[0].LICENCE_NO },
                         why: 'devices + holder for the first result',
-                    }];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
+                    }] : undefined;
+                const response = pagedSearchResponse(name, args ?? {}, rows, {}, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -874,7 +974,7 @@ function createServer(): Server {
 
                 const response: any = { ...result };
                 if (resultId) response.result_id = resultId;
-                if (resultId && (result.devices as any[]).some((d: any) => d.LATITUDE != null && d.LONGITUDE != null)) {
+                if (args?.include_hints === true && resultId && (result.devices as any[]).some((d: any) => d.LATITUDE != null && d.LONGITUDE != null)) {
                     response._hints = [{
                         tool: 'export_kml',
                         args: { result_id: resultId },
@@ -882,7 +982,7 @@ function createServer(): Server {
                     }];
                 }
 
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -891,26 +991,13 @@ function createServer(): Server {
             try {
                 const rows = searchSites(db, args?.query as string, (args?.limit as number) ?? 10) as any[];
 
-                // Cache results for potential KML export
-                let resultId: string | undefined;
-                if (rows.length > 0) {
-                    const columns = Object.keys(rows[0] as object);
-                    if (hasGeospatialData(columns)) {
-                        const rowArrays = rows.map(r => columns.map(c => (r as any)[c]));
-                        resultId = cacheResult(columns, rowArrays);
-                    }
-                }
-
-                const envelope: any = { rows };
-                if (resultId) envelope.result_id = resultId;
-                if (rows.length > 0) {
-                    envelope._hints = [{
+                const hints = rows.length > 0 ? [{
                         tool: 'get_site_details',
                         args: { site_id: String(rows[0].SITE_ID) },
                         why: 'devices at this site',
-                    }];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
+                    }] : undefined;
+                const response = pagedSearchResponse(name, args ?? {}, rows, {}, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -934,7 +1021,7 @@ function createServer(): Server {
 
                 const response: any = { ...result };
                 if (resultId) response.result_id = resultId;
-                if (resultId) {
+                if (args?.include_hints === true && resultId) {
                     response._hints = [{
                         tool: 'export_kml',
                         args: { result_id: resultId },
@@ -942,7 +1029,7 @@ function createServer(): Server {
                     }];
                 }
 
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -950,15 +1037,13 @@ function createServer(): Server {
             const db = openDb();
             try {
                 const rows = searchClients(db, args?.query as string, (args?.limit as number) ?? 10) as any[];
-                const envelope: any = { rows };
-                if (rows.length > 0 && rows[0]?.CLIENT_NO != null) {
-                    envelope._hints = [{
+                const hints = rows.length > 0 && rows[0]?.CLIENT_NO != null ? [{
                         tool: 'get_client_details',
                         args: { client_no: rows[0].CLIENT_NO },
                         why: 'licences held by the first matching client',
-                    }];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
+                    }] : undefined;
+                const response = pagedSearchResponse(name, args ?? {}, rows, {}, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -972,14 +1057,14 @@ function createServer(): Server {
                 );
                 if (!result) return { content: [{ type: 'text', text: `No client found for ID: ${args?.client_no}` }] };
                 const response: any = { ...result };
-                if (result.licences.length > 0 && (result.licences[0] as any).LICENCE_NO) {
+                if (args?.include_hints === true && result.licences.length > 0 && (result.licences[0] as any).LICENCE_NO) {
                     response._hints = [{
                         tool: 'get_licence_details',
                         args: { licence_no: (result.licences[0] as any).LICENCE_NO },
                         why: 'devices and authorisations for the first licence',
                     }];
                 }
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -991,7 +1076,7 @@ function createServer(): Server {
                     query = normalizeFrequencyRange(args ?? {});
                 } catch (err) {
                     const message = err instanceof Error ? err.message : String(err);
-                    return { content: [{ type: 'text', text: JSON.stringify({ _error: message }, null, 2) }], isError: true };
+                    return { content: [{ type: 'text', text: JSON.stringify({ _error: message }) }], isError: true };
                 }
                 const state = args?.state as string | undefined;
                 const rawLimit = args?.limit as number | undefined;
@@ -1007,26 +1092,17 @@ function createServer(): Server {
                 ) as any[];
                 const truncated = matches.length > limit;
                 const rows = truncated ? matches.slice(0, limit) : matches;
-                const envelope: any = {
+                const hints = rows.length > 0 && rows[0]?.LICENCE_NO ? [{
+                    tool: 'get_licence_details',
+                    args: { licence_no: rows[0].LICENCE_NO },
+                    why: 'full details for the first matching assignment',
+                }] : undefined;
+                const response = pagedSearchResponse(name, args ?? {}, rows, {
                     query,
-                    rows,
                     rows_returned: rows.length,
                     rows_truncated: truncated,
-                };
-                if (rows.length > 0) {
-                    const columns = Object.keys(rows[0] as object);
-                    if (hasGeospatialData(columns)) {
-                        envelope.result_id = cacheResult(columns, rows.map(r => columns.map(c => r[c])));
-                    }
-                    if (rows[0]?.LICENCE_NO) {
-                        envelope._hints = [{
-                            tool: 'get_licence_details',
-                            args: { licence_no: rows[0].LICENCE_NO },
-                            why: 'full details for the first matching assignment',
-                        }];
-                    }
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
+                }, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -1034,7 +1110,8 @@ function createServer(): Server {
             const db = openDb();
             try {
                 const results = searchBsl(db, args?.query as string, (args?.limit as number) ?? 10);
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+                const response = pagedSearchResponse(name, args ?? {}, results as Array<Record<string, unknown>>);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
@@ -1046,7 +1123,7 @@ function createServer(): Server {
                     query = normalizeFrequencyRange(args ?? {});
                 } catch (err) {
                     const message = err instanceof Error ? err.message : String(err);
-                    return { content: [{ type: 'text', text: JSON.stringify({ _error: message }, null, 2) }], isError: true };
+                    return { content: [{ type: 'text', text: JSON.stringify({ _error: message }) }], isError: true };
                 }
                 const results = searchSpectrumBand(
                     db,
@@ -1054,7 +1131,8 @@ function createServer(): Server {
                     query.freq_max_hz,
                     (args?.limit as number) ?? 20
                 );
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+                const response = pagedSearchResponse(name, args ?? {}, results as Array<Record<string, unknown>>, { query });
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { db.close(); }
         }
 
@@ -1066,15 +1144,13 @@ function createServer(): Server {
                     args?.query as string,
                     (args?.limit as number) ?? 20
                 ) as any[];
-                const envelope: any = { rows };
-                if (rows.length > 0 && rows[0]?.APTB_ID != null) {
-                    envelope._hints = [{
+                const hints = rows.length > 0 && rows[0]?.APTB_ID != null ? [{
                         tool: 'execute_sql',
                         args: { sql: `SELECT APTB_TEXT FROM applic_text_block WHERE APTB_ID = ${rows[0].APTB_ID}` },
                         why: 'full text for the first result',
-                    }];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
+                    }] : undefined;
+                const response = pagedSearchResponse(name, args ?? {}, rows, {}, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { db.close(); }
         }
 
@@ -1131,14 +1207,14 @@ function createServer(): Server {
             if (args?.category !== undefined) filter.category = args.category as any;
             if (args?.name !== undefined) filter.name = args.name as string;
             const result = listSampleQueries(Object.keys(filter).length > 0 ? filter : undefined);
-            return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
 
         if (name === 'describe_schema') {
             const db = openDb();
             try {
                 const result = describeSchema(db, args?.tables as string[] | undefined);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+                return { content: [{ type: 'text', text: JSON.stringify(result) }] };
             } finally { db.close(); }
         }
 
@@ -1158,7 +1234,7 @@ function createServer(): Server {
             const db = openDb();
             try {
                 const plan = explainQuery(db, args?.sql as string);
-                return { content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }] };
+                return { content: [{ type: 'text', text: JSON.stringify(plan) }] };
             } finally { db.close(); }
         }
 
@@ -1168,23 +1244,16 @@ function createServer(): Server {
             try {
                 const result = await executeSqlWithTimeout(dbPath, sql, limit, 25_000);
 
-                // Cache results for potential KML export if geospatial data detected
-                let resultId: string | undefined;
-                if (result.rowCount > 0 && hasGeospatialData(result.columns)) {
-                    resultId = cacheResult(result.columns, result.rows);
-                }
-
-                const response: any = { ...result };
-                if (resultId) {
-                    response.result_id = resultId;
-                    response._hints = [{
+                const hints = result.rowCount > 0 && hasGeospatialData(result.columns) ? [{
                         tool: 'export_kml',
-                        args: { result_id: resultId },
+                        args: { result_id: '<result_id from this response>' },
                         why: 'render geospatially',
-                    }];
-                }
-
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+                    }] : undefined;
+                const response = pagedColumnarResponse(name, args ?? {}, result.columns, result.rows, {
+                    truncated: result.truncated,
+                    rowCount: result.rowCount,
+                }, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } catch (err: any) {
                 return {
                     content: [{ type: 'text', text: `SQL Error: ${err.message}` }],
@@ -1214,13 +1283,29 @@ function createServer(): Server {
             };
         }
 
+        if (name === 'get_result_page') {
+            const id = args?.result_id as string;
+            const page = resultCache.page(
+                id,
+                (args?.offset as number | undefined) ?? 0,
+                (args?.limit as number | undefined) ?? 25
+            );
+            if (!page) {
+                return {
+                    content: [{ type: 'text', text: JSON.stringify({ _error: `Result not found or expired: ${id}` }) }],
+                    isError: true,
+                };
+            }
+            return { content: [{ type: 'text', text: JSON.stringify(page) }] };
+        }
+
         if (name === 'get_frequency_allocation') {
             let query;
             try {
                 query = normalizeFrequencyPoint(args ?? {});
             } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
-                return { content: [{ type: 'text', text: JSON.stringify({ _error: message }, null, 2) }], isError: true };
+                return { content: [{ type: 'text', text: JSON.stringify({ _error: message }) }], isError: true };
             }
             const freq_hz = query.freq_hz;
             const include_footnotes = args?.include_footnotes !== false;  // default true
@@ -1228,7 +1313,7 @@ function createServer(): Server {
             try {
                 const tableCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
                 if (tableCount === 0) {
-                    return { content: [{ type: 'text', text: JSON.stringify({ _error: "Spectrum plan data not loaded. Run 'npm run import-spectrum-plan -- --reseed'." }, null, 2) }] };
+                    return { content: [{ type: 'text', text: JSON.stringify({ _error: "Spectrum plan data not loaded. Run 'npm run import-spectrum-plan -- --reseed'." }) }] };
                 }
                 const result: any = lookupFrequencyAllocation(db, freq_hz, include_footnotes);
                 result.query = query;
@@ -1259,25 +1344,25 @@ function createServer(): Server {
                     result._warning = warnings.join(' ');
                 }
 
-                if (result.match_count > 0) {
+                if (args?.include_hints === true && result.match_count > 0) {
                     result._hints = [
                         { tool: 'search_licences', why: 'find licences operating in this band' },
                         { tool: 'search_application_text', why: "search application text for this band's usage" },
                     ];
                 }
 
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+                return { content: [{ type: 'text', text: JSON.stringify(result) }] };
             } finally { if (db.open) db.close(); }
         }
 
         if (name === 'decode_emission_designator') {
             const code = args?.code as string;
             if (typeof code !== 'string') {
-                return { content: [{ type: 'text', text: JSON.stringify({ _error: 'code must be a string.' }, null, 2) }] };
+                return { content: [{ type: 'text', text: JSON.stringify({ _error: 'code must be a string.' }) }] };
             }
             const decoded = decodeEmissionDesignator(code);
             const response: any = { ...decoded };
-            if (decoded.valid) {
+            if (args?.include_hints === true && decoded.valid) {
                 response._hints = [
                     {
                         tool: 'search_devices_by_emission',
@@ -1290,27 +1375,50 @@ function createServer(): Server {
                     },
                 ];
             }
-            return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+            return { content: [{ type: 'text', text: JSON.stringify(response) }] };
         }
 
         if (name === 'search_devices_by_emission') {
             const db = openDb();
             try {
                 const result = searchDevicesByEmission(db, (args ?? {}) as any);
-                const response: any = { ...result };
-                if (!result._error && result.rows.length > 0) {
+                if (result._error) {
+                    return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+                }
+                const hints = result.rows.length > 0 ? (() => {
                     const first = result.rows[0]!;
-                    response._hints = [
+                    return [
                         { tool: 'get_licence_details', args: { licence_no: first.LICENCE_NO }, why: 'open the first matching licence' },
                         { tool: 'decode_emission_designator', args: { code: first.EMISSION.trim() }, why: 'full breakdown of any returned EMISSION value' },
                         { tool: 'execute_sql', why: 'aggregate or refine these results' },
                     ];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
+                })() : undefined;
+                const response = pagedSearchResponse(name, args ?? {}, result.rows as unknown as Array<Record<string, unknown>>, {
+                    truncated: result.truncated,
+                    resolved_filters: result.resolved_filters,
+                }, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
 
         return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
+            })();
+            return completed;
+        } finally {
+            const elapsed = performance.now() - started;
+            const text = completed?.content?.find((item: any) => item?.type === 'text')?.text ?? '';
+            let rows = 0;
+            let cached = false;
+            try {
+                const payload = JSON.parse(text);
+                rows = Array.isArray(payload?.rows) ? payload.rows.length : 0;
+                cached = payload?.duplicate === true;
+            } catch { /* non-JSON tool response */ }
+            log.info(
+                `[MCP_PERF] tool=${name} db_ms=${DB_TOOLS.has(name) ? elapsed.toFixed(1) : '0.0'} ` +
+                `total_ms=${elapsed.toFixed(1)} rows=${rows} output_bytes=${Buffer.byteLength(text)} cached=${cached}`
+            );
+        }
     });
 
     return server;
