@@ -11,6 +11,7 @@ import { initializeDatabase, TABLE_METADATA } from './db.js';
 import { bootstrapSpectrumPlan } from './spectrum_plan.js';
 import { bootstrapEmissionTables } from './emissions.js';
 import { log } from './logger.js';
+import { rebuildSearchIndex } from './search_fts.js';
 
 export interface SyncConfig {
     extractsUrl: string;
@@ -471,12 +472,13 @@ export async function performFullSync(config: SyncConfig, fullEntry: ExtractEntr
             });
         }
 
-        // Rebuild the FTS5 index over the freshly-imported applic_text_block rows.
-        // External-content FTS5 requires an explicit rebuild after bulk import.
-        log.info('Rebuilding FTS5 index over applic_text_block...');
+        // Rebuild both derived search indexes after the bulk import. Neither
+        // index changes the source ACMA tables.
+        log.info('Rebuilding FTS5 search indexes...');
         const ftsDb = new Database(config.dbPath);
         try {
             ftsDb.exec(`INSERT INTO applic_text_block_fts(applic_text_block_fts) VALUES('rebuild');`);
+            rebuildSearchIndex(ftsDb);
         } finally {
             ftsDb.close();
         }
@@ -709,6 +711,9 @@ export async function sync(
                 const newAsOf = action.entries.at(-1)!.LastMdified;
                 const db = new Database(config.dbPath);
                 try {
+                    // Client, licence and site rows may all have changed. A
+                    // deterministic rebuild keeps cross-entity search current.
+                    rebuildSearchIndex(db);
                     const incSyncStamp = new Date().toISOString();
                     db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('as_of', newAsOf);
                     db.prepare('REPLACE INTO meta (key, value) VALUES (?, ?)').run('last_sync', incSyncStamp);
@@ -881,4 +886,3 @@ export function isInputZipStale(zipPath: string, remoteTimestamp: Date): boolean
     const mtime = fs.statSync(zipPath).mtime;
     return mtime < remoteTimestamp;
 }
-

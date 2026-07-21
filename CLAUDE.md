@@ -47,9 +47,9 @@ The local SQLite database is kept in step with ACMA via the manifest at `https:/
 
 ### MCP server
 
-`src/index.ts` is the entry point. It spins up an Express app exposing `POST /mcp` (initialization + RPC) and `GET /mcp` (SSE notification stream), with `Mcp-Session-Id` correlating both. Each session gets its own `StreamableHTTPServerTransport`. A 30-minute in-memory **result cache** ties `execute_sql` outputs to subsequent `export_kml` calls via `result_id`.
+`src/index.ts` is the entry point. It spins up an Express app exposing `POST /mcp` (initialization + RPC) and `GET /mcp` (SSE notification stream), with `Mcp-Session-Id` correlating both. Each session gets its own `StreamableHTTPServerTransport`. A 30-minute in-memory **result cache** pages search/SQL output, deduplicates identical calls, and ties geospatial results to `export_kml` via `result_id`.
 
-**Tool catalog (21 tools, registered in `index.ts`):** `search_sites`, `get_site_details`, `search_licences`, `get_licence_details`, `search_clients`, `get_client_details`, `search_frequency_assignments`, `search_bsl`, `search_spectrum_band`, `search_application_text`, `get_frequency_allocation`, `decode_emission_designator`, `search_devices_by_emission`, `sync_data`, `list_sample_queries`, `execute_sql`, `explain_query`, `export_kml`, `get_result_page`, `describe_schema`, `describe_tool`.
+**Tool catalog (23 tools, registered in `index.ts`):** `search_everything`, `lookup_client`, `search_sites`, `get_site_details`, `search_licences`, `get_licence_details`, `search_clients`, `get_client_details`, `search_frequency_assignments`, `search_bsl`, `search_spectrum_band`, `search_application_text`, `get_frequency_allocation`, `decode_emission_designator`, `search_devices_by_emission`, `sync_data`, `list_sample_queries`, `execute_sql`, `explain_query`, `export_kml`, `get_result_page`, `describe_schema`, `describe_tool`.
 
 Frequency-facing tools accept either explicit `*_mhz` fields (preferred when the user says MHz) or `*_hz` fields (when the user explicitly says Hz). `src/frequency_input.ts` validates and normalizes these inputs; never mix units or ask the chat model to perform the conversion itself.
 
@@ -61,14 +61,14 @@ Each tool's `tools/list` entry is a one-line summary + capability tag; the full 
 
 ### Database
 
-`src/db.ts` declares `TABLE_METADATA` — DDL + post-load indexes for every materialised table. There are 32 tables + `meta` + the FTS5 virtual table `applic_text_block_fts`:
+`src/db.ts` declares `TABLE_METADATA` — DDL + post-load indexes for every materialised table. There are 32 tables + `meta` + two derived FTS5 virtual tables (`applic_text_block_fts` and `rrl_search_fts`):
 
 - **Core 5:** `client`, `licence`, `site`, `device_details`, `antenna`.
 - **Broadcasting + spectrum:** `bsl`, `bsl_area`, `auth_spectrum_freq` (4-col composite PK), `auth_spectrum_area` (2-col composite PK).
 - **Satellite:** `satellite`.
 - **Spectrum plan (lookup-only):** `spectrum_allocations` (composite PK `freq_start_hz`+`freq_end_hz`, columns `unit`, `page`, `services_json`, `footnotes_json`, `raw`), `spectrum_region_allocations` (ITU R1/R2/R3 allocations keyed independently of AU sub-ranges), `spectrum_australian_footnotes`, `spectrum_international_footnotes`, `spectrum_plan_meta`. Canonical source is `seed/spectrum_plan_source.yaml` (extracted from the 2021 ACMA Spectrum Plan PDF by `tools/extract-rrsp/extract.py`); `seed/spectrum_plan.sql` is generated from the YAML + any overlays in `seed/patches/` by `scripts/generate-spectrum-seed.ts`. Auto-bootstrapped at the tail of `performFullSync` when empty. Not part of the RRL sync; upgrade an existing DB with `npm run import-spectrum-plan -- --reseed`.
 - **Emission designator decoder (lookup-only):** `emission_modulation` (18 rows), `emission_signal_nature` (8), `emission_info_type` (9), `emission_signal_detail` (15), `emission_multiplex` (6). Populated from `seed/emissions.sql` (committed); regenerate via `npm run dump-emissions` after editing `CODE_TABLES` in `src/emissions.ts`. Auto-bootstrapped at the tail of `performFullSync` when empty. To seed an existing database without a full sync, run `npm run import-emissions`.
-- **Narrative:** `applic_text_block` (~168 MB CSV), `reports_text_block`; FTS5 virtual table over `applic_text_block.APTB_TEXT` rebuilt during full sync.
+- **Search:** `applic_text_block_fts` indexes application narrative. `rrl_search_fts` indexes client/licence/site identity, names, ABN/ACN and complete postal/site text. Both are derived and rebuilt after full sync; the cross-entity index is also rebuilt after incremental sync.
 - **10 lookups:** `client_type`, `fee_status`, `industry_cat`, `licence_service`, `licence_subservice` (composite PK), `licence_status`, `nature_of_service`, `class_of_station`, `licensing_area`, `antenna_polarity`. JOINed by `src/logic.ts` to surface human-readable names.
 
 RRL ETL tables (`client`, `licence`, `site`, `device_details`, `antenna`, etc.) do NOT declare primary keys — incremental application relies on `PK_BY_TABLE: Record<string, string | string[]>` in `src/sync.ts` for the DELETE step (string for single-column PKs; array for composites). The spectrum plan and emission lookup tables DO use DDL primary keys (e.g. `spectrum_allocations` has a composite PK on `freq_start_hz`+`freq_end_hz`). The change-zip CSVs may use slightly different table names than the full extract (e.g. `device_detail` singular vs `device_details` plural) — `csvToTable` in `src/sync.ts` handles aliasing.

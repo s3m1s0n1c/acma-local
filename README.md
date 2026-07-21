@@ -2,23 +2,24 @@
 
 A Model Context Protocol (MCP) server that exposes the Australian Communications and Media Authority (ACMA) [Register of Radiocommunications Licences (RRL)](https://www.acma.gov.au/radiocomms-licence-data) and the [Australian Radiofrequency Spectrum Plan (ARSP)](https://www.acma.gov.au/australian-radiofrequency-spectrum-plan) as a local SQLite mirror, with manifest-driven sync against ACMA's REST API.
 
-The server speaks two transports: **stdio** (Claude Desktop, LM Studio local) and **Streamable HTTP/SSE** on `:3000` (LM Studio 0.3.17+, networked MCP hosts). Both modes share the same 21-tool catalog.
+The server speaks two transports: **stdio** (Claude Desktop, LM Studio local) and **Streamable HTTP/SSE** on `:3000` (LM Studio 0.3.17+, networked MCP hosts). Both modes share the same 23-tool catalog.
 
 ## Features
 
 - **Local mirror** of the full RRL dataset (32 materialised tables + FTS5 narrative index), kept fresh by ACMA's `/v1/Extracts` manifest API — mobile-friendly by default (no automatic 70 MB downloads).
-- **Full-text search** (SQLite FTS5) over application narrative — answers "which licences mention 'remote operation'?" in milliseconds.
+- **Full-text search** (SQLite FTS5) across clients, licence holders, ABN/ACN, postal addresses, licence numbers, sites and application narrative.
+- **One-call lookups** — `lookup_client` returns a holder's address plus optional licences and devices without a model-driven tool chain; `search_everything` searches the main entities together.
 - **Geospatial export** — site/device results carry coordinates and can be rendered as KML via `export_kml`.
 - **Spectrum plan lookup** — `get_frequency_allocation(freq_mhz)` (or the legacy `freq_hz`) returns the AU primary allocation plus ITU Region 1/2/3 contrast rows and resolved footnote text. Data rebuilt from the 2021 ACMA Spectrum Plan PDF; seeded from `seed/spectrum_plan.sql`.
 - **Power-user SQL** — `execute_sql` runs sandboxed SELECT/WITH queries in a worker thread; `explain_query`, `describe_schema`, and `list_sample_queries` make the schema discoverable.
 - **Progressive disclosure** — `tools/list` returns terse one-liners; `describe_tool(<name>)` fetches the full markdown when needed (matterfront pattern).
 
-## Tools (21)
+## Tools (23)
 
 | Group | Tools |
 |---|---|
-| **Search** (find records by name/ID/frequency) | `search_licences`, `search_sites`, `search_clients`, `search_frequency_assignments`, `search_bsl`, `search_devices_by_emission` |
-| **Detail lookups** | `get_licence_details`, `get_site_details`, `get_client_details` |
+| **Search** (find records by name/ID/frequency) | `search_everything`, `search_licences`, `search_sites`, `search_clients`, `search_frequency_assignments`, `search_bsl`, `search_devices_by_emission` |
+| **Detail lookups** | `lookup_client`, `get_licence_details`, `get_site_details`, `get_client_details` |
 | **Spectrum & narrative** | `search_spectrum_band`, `search_application_text`, `get_frequency_allocation` |
 | **SQL backend** | `execute_sql`, `list_sample_queries`, `explain_query` |
 | **Output** | `export_kml` (geospatial render of cached results) |
@@ -30,6 +31,12 @@ The server speaks two transports: **stdio** (Claude Desktop, LM Studio local) an
 Search-style tools return compact columnar pages with a 30-minute `result_id`. Use
 `get_result_page` to read later rows without rerunning the database query. Follow-up
 `_hints` are disabled by default; pass `include_hints: true` only when they are wanted.
+Identical search calls return the existing `result_id` instead of sending the same rows again.
+
+`search_everything` ranks exact IDs and names first, followed by exact phrases,
+prefixes, FTS matches and finally substring fallbacks. The derived FTS index is
+rebuilt automatically after both full and incremental syncs; the source tables
+and ACMA schema remain unchanged.
 
 Frequency tools accept explicit MHz fields as well as Hz fields. For example, use
 `{ "freq_min_mhz": 476.425, "freq_max_mhz": 477.4125 }` when the user supplies MHz;

@@ -258,7 +258,7 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         await transport.close();
     }, 15000);
 
-    test('tools/list advertises the full 21-tool catalog', async () => {
+    test('tools/list advertises the full 23-tool catalog', async () => {
         const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
         const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
         await client.connect(transport);
@@ -272,7 +272,9 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         expect(tools.tools.some(t => t.name === 'get_client_details')).toBe(true);
         expect(tools.tools.some(t => t.name === 'search_frequency_assignments')).toBe(true);
         expect(tools.tools.some(t => t.name === 'get_result_page')).toBe(true);
-        expect(tools.tools.length).toBe(21);
+        expect(tools.tools.some(t => t.name === 'lookup_client')).toBe(true);
+        expect(tools.tools.some(t => t.name === 'search_everything')).toBe(true);
+        expect(tools.tools.length).toBe(23);
 
         await transport.close();
     }, 15000);
@@ -315,6 +317,37 @@ describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
         const response = await callMcpTool('search_clients', { query: 'Test', limit: 1 });
         const parsed = JSON.parse(response);
         expect(parsed._hints).toBeUndefined();
+    }, 15000);
+
+    test('lookup_client returns client, licences and devices in one response', async () => {
+        const response = JSON.parse(await callMcpTool('lookup_client', {
+            query: 'MHz Fixture Client',
+            include_licences: true,
+            include_devices: true,
+        }));
+        expect(response.found).toBe(true);
+        expect(response.client).toMatchObject({ CLIENT_NO: 9001, LICENCEE: 'MHz Fixture Client' });
+        expect(response.licences.columns).toContain('LICENCE_NO');
+        expect(response.licences.rows.length).toBeGreaterThan(0);
+        expect(response.devices.rows).toHaveLength(2);
+    }, 15000);
+
+    test('search_everything returns ranked columnar results', async () => {
+        // The server initialized before this fixture was inserted, so rebuild
+        // the derived search index just as a sync would.
+        const db = new Database(testDbPath);
+        const { rebuildSearchIndex } = await import('../src/search_fts.js');
+        rebuildSearchIndex(db);
+        db.close();
+
+        const response = JSON.parse(await callMcpTool('search_everything', {
+            query: 'MHz Fixture Client',
+            entity_types: ['client', 'licence'],
+            include_related: true,
+        }));
+        const rows = expandRows(response);
+        expect(rows.some(row => row.ENTITY_TYPE === 'client' && row.ENTITY_ID === '9001')).toBe(true);
+        expect(response.total).toBeGreaterThan(0);
     }, 15000);
 
     test('cached results are pageable and identical calls are deduplicated', async () => {
@@ -526,6 +559,7 @@ COMMIT;
         const advertised = [
             'search_licences', 'get_licence_details', 'search_sites', 'get_site_details',
             'search_clients', 'search_bsl', 'search_spectrum_band', 'search_application_text',
+            'lookup_client', 'search_everything',
             'get_frequency_allocation', 'sync_data', 'list_sample_queries', 'execute_sql',
             'export_kml', 'get_result_page', 'describe_schema', 'describe_tool', 'explain_query',
             'decode_emission_designator', 'search_devices_by_emission',

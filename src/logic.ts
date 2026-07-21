@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { searchEntityIds } from './search_fts.js';
 
 const MAX_SEARCH_RESULTS = 500;
 const DEFAULT_DETAIL_LIMIT = 50;
@@ -21,6 +22,20 @@ function cleanQuery(query: string): string {
 export function searchSites(db: Database.Database, query: string, limit: number = 20) {
   const exact = cleanQuery(query);
   if (!exact) return [];
+  const maxResults = clampLimit(limit, 20);
+  const indexedIds = searchEntityIds(db, 'site', exact, maxResults);
+  if (indexedIds.length > 0) {
+    const placeholders = indexedIds.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT s.*, la.DESCRIPTION AS LICENSING_AREA_NAME,
+             (SELECT COUNT(*) FROM device_details d WHERE d.SITE_ID = s.SITE_ID) AS DEVICE_COUNT
+      FROM site s
+      LEFT JOIN licensing_area la ON la.LICENSING_AREA_ID = s.LICENSING_AREA_ID
+      WHERE s.SITE_ID IN (${placeholders})
+    `).all(...indexedIds) as any[];
+    const order = new Map(indexedIds.map((id, index) => [id, index]));
+    return rows.sort((a, b) => (order.get(String(a.SITE_ID)) ?? maxResults) - (order.get(String(b.SITE_ID)) ?? maxResults));
+  }
   const pattern = likePattern(exact);
   return db.prepare(`
     SELECT s.*, la.DESCRIPTION AS LICENSING_AREA_NAME,
@@ -38,7 +53,7 @@ export function searchSites(db: Database.Database, query: string, limit: number 
       ELSE 3 END,
       s.NAME
     LIMIT @limit
-  `).all({ pattern, exact, limit: clampLimit(limit, 20) });
+  `).all({ pattern, exact, limit: maxResults });
 }
 
 export function getSiteDetails(db: Database.Database, siteId: string, deviceLimit: number = DEFAULT_DETAIL_LIMIT) {
@@ -120,6 +135,14 @@ const CLIENT_SELECT = `
 export function searchLicences(db: Database.Database, query: string, limit: number = 20) {
   const exact = cleanQuery(query);
   if (!exact) return [];
+  const maxResults = clampLimit(limit, 20);
+  const indexedIds = searchEntityIds(db, 'licence', exact, maxResults);
+  if (indexedIds.length > 0) {
+    const placeholders = indexedIds.map(() => '?').join(',');
+    const rows = db.prepare(`${LICENCE_SELECT} WHERE l.LICENCE_NO IN (${placeholders})`).all(...indexedIds) as any[];
+    const order = new Map(indexedIds.map((id, index) => [id, index]));
+    return rows.sort((a, b) => (order.get(String(a.LICENCE_NO)) ?? maxResults) - (order.get(String(b.LICENCE_NO)) ?? maxResults));
+  }
   const pattern = likePattern(exact);
   return db.prepare(`
     ${LICENCE_SELECT}
@@ -137,7 +160,7 @@ export function searchLicences(db: Database.Database, query: string, limit: numb
       ELSE 4 END,
       l.LICENCE_NO
     LIMIT @limit
-  `).all({ pattern, exact, limit: clampLimit(limit, 20) });
+  `).all({ pattern, exact, limit: maxResults });
 }
 
 export function searchLicencesWithSites(db: Database.Database, query: string, limit: number = 20) {
@@ -168,6 +191,15 @@ export function searchLicencesWithSites(db: Database.Database, query: string, li
 export function searchClients(db: Database.Database, query: string, limit: number = 20) {
   const exact = cleanQuery(query);
   if (!exact) return [];
+  const maxResults = clampLimit(limit, 20);
+  const indexedIds = searchEntityIds(db, 'client', exact, maxResults);
+  if (indexedIds.length > 0) {
+    const numericIds = indexedIds.map(Number).filter(Number.isFinite);
+    const placeholders = numericIds.map(() => '?').join(',');
+    const rows = db.prepare(`${CLIENT_SELECT} WHERE c.CLIENT_NO IN (${placeholders})`).all(...numericIds) as any[];
+    const order = new Map(indexedIds.map((id, index) => [id, index]));
+    return rows.sort((a, b) => (order.get(String(a.CLIENT_NO)) ?? maxResults) - (order.get(String(b.CLIENT_NO)) ?? maxResults));
+  }
   const pattern = likePattern(exact);
   return db.prepare(`
     ${CLIENT_SELECT}
@@ -188,7 +220,63 @@ export function searchClients(db: Database.Database, query: string, limit: numbe
       ELSE 4 END,
       c.LICENCEE
     LIMIT @limit
-  `).all({ pattern, exact, limit: clampLimit(limit, 20) });
+  `).all({ pattern, exact, limit: maxResults });
+}
+
+/** Resolve a holder and the related records needed for common chat questions in one call. */
+export function lookupClient(
+  db: Database.Database,
+  query: string,
+  includeLicences: boolean = true,
+  includeDevices: boolean = false,
+  limit: number = DEFAULT_DETAIL_LIMIT
+) {
+  const maxRelated = clampLimit(limit, DEFAULT_DETAIL_LIMIT);
+  const matches = searchClients(db, query, 10) as any[];
+  if (matches.length === 0) return null;
+
+  const client = matches[0];
+  const clientNo = Number(client.CLIENT_NO);
+  const result: Record<string, unknown> = {
+    client,
+    client_matches: matches.length,
+  };
+
+  if (includeLicences) {
+    const total = (db.prepare('SELECT COUNT(*) AS count FROM licence WHERE CLIENT_NO = ?').get(clientNo) as { count: number }).count;
+    const licences = db.prepare(`${LICENCE_SELECT} WHERE l.CLIENT_NO = ? ORDER BY l.DATE_OF_EXPIRY DESC, l.LICENCE_NO LIMIT ?`)
+      .all(clientNo, maxRelated);
+    result.licences = licences;
+    result.licences_total = total;
+    result.licences_truncated = total > licences.length;
+  }
+
+  if (includeDevices) {
+    const total = (db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM device_details d
+      JOIN licence l ON l.LICENCE_NO = d.LICENCE_NO
+      WHERE l.CLIENT_NO = ?
+    `).get(clientNo) as { count: number }).count;
+    const devices = db.prepare(`
+      SELECT d.SDD_ID, d.LICENCE_NO, d.DEVICE_REGISTRATION_IDENTIFIER,
+             d.FREQUENCY, d.CARRIER_FREQ, d.BANDWIDTH, d.EMISSION,
+             d.DEVICE_TYPE, d.CALL_SIGN, d.STATION_NAME,
+             s.SITE_ID, s.NAME AS SITE_NAME, s.STATE, s.POSTCODE,
+             s.LATITUDE, s.LONGITUDE
+      FROM device_details d
+      JOIN licence l ON l.LICENCE_NO = d.LICENCE_NO
+      LEFT JOIN site s ON s.SITE_ID = d.SITE_ID
+      WHERE l.CLIENT_NO = ?
+      ORDER BY d.FREQUENCY, d.LICENCE_NO, d.SDD_ID
+      LIMIT ?
+    `).all(clientNo, maxRelated);
+    result.devices = devices;
+    result.devices_total = total;
+    result.devices_truncated = total > devices.length;
+  }
+
+  return result;
 }
 
 export function getClientDetails(db: Database.Database, clientNo: number, licenceLimit: number = DEFAULT_DETAIL_LIMIT) {

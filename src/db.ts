@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { ensureSearchIndex } from './search_fts.js';
 
 export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: string }> = {
   "client": {
@@ -239,6 +240,18 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
       );
     `
   },
+  "rrl_search_fts": {
+    "ddl": `
+      CREATE VIRTUAL TABLE IF NOT EXISTS rrl_search_fts USING fts5(
+        entity_type UNINDEXED,
+        entity_id UNINDEXED,
+        primary_text,
+        secondary_text,
+        search_text,
+        tokenize='unicode61 remove_diacritics 2'
+      );
+    `
+  },
   "spectrum_allocations": {
     "ddl": `
       CREATE TABLE IF NOT EXISTS spectrum_allocations(
@@ -370,6 +383,11 @@ export function initializeDatabase(dbPath: string) {
       }
     }
   })();
+
+  // This is a derived index only. Existing databases are populated once when
+  // the schema version changes; normal full/incremental syncs rebuild it after
+  // importing ACMA rows.
+  ensureSearchIndex(db);
 
   db.close();
 }

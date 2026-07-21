@@ -9,6 +9,7 @@ import {
     searchSpectrumBand,
     searchApplicationText,
     searchFrequencyAssignments,
+    lookupClient,
 } from '../src/logic.js';
 import { initializeDatabase } from '../src/db.js';
 import Database from 'better-sqlite3';
@@ -89,6 +90,16 @@ describe('Logic Layer', () => {
         expect(result.licences.map((l: any) => l.LICENCE_NO)).toContain('L1');
         expect(result.licences_total).toBeGreaterThanOrEqual(1);
         expect(result.licences_truncated).toBe(false);
+    });
+
+    test('lookupClient returns the address, licences and devices in one call', () => {
+        const result = lookupClient(db, 'Test Client', true, true, 50) as any;
+        expect(result.client).toMatchObject({ CLIENT_NO: 1, POSTAL_STREET: '5 Example Road' });
+        expect(result.licences.map((row: any) => row.LICENCE_NO)).toContain('L1');
+        expect(result.devices).toHaveLength(1);
+        expect(result.devices[0]).toMatchObject({ SDD_ID: 101, FREQUENCY: 100000000, SITE_NAME: 'Sydney Tower' });
+        expect(result.licences_truncated).toBe(false);
+        expect(result.devices_truncated).toBe(false);
     });
 
     test('getLicenceDetails should return licence, client and devices', () => {

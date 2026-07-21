@@ -9,7 +9,8 @@
  *                    search_bsl, search_spectrum_band, search_application_text,
  *                    describe_schema, describe_tool, explain_query,
  *                    get_frequency_allocation, decode_emission_designator,
- *                    search_devices_by_emission, get_result_page.
+ *                    search_devices_by_emission, get_result_page,
+ *                    lookup_client, search_everything.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -33,6 +34,7 @@ import {
     searchBsl,
     searchSpectrumBand,
     searchApplicationText,
+    lookupClient,
 } from './logic.js';
 import { executeSqlWithTimeout, listSampleQueries, describeSchema, explainQuery } from './sql.js';
 import { generateKml } from './kml.js';
@@ -41,6 +43,7 @@ import { decodeEmissionDesignator } from './emissions.js';
 import { searchDevicesByEmission } from './emissions_search.js';
 import { normalizeFrequencyPoint, normalizeFrequencyRange } from './frequency_input.js';
 import { ResultCache, objectRowsToColumnar } from './result_cache.js';
+import { searchEverything, type SearchEntityType } from './search_fts.js';
 import { log } from './logger.js';
 
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
@@ -148,6 +151,41 @@ Resolve a CLIENT_NO through the CLIENT_NO relationship to licence records.
 - client: full holder and postal-address record with resolved client type, fee status and industry.
 - licences: related licence records with resolved service/subservice/status.
 - licences_total, licences_returned, licences_truncated: explicit pagination metadata.`,
+    },
+    lookup_client: {
+        summary: 'Find a client and return their address, licences and optional devices in one call. [primary]',
+        tags: ['primary', 'lookup'],
+        fullDescription: `
+### [Composite Client Lookup]
+Resolve a person or organisation and fetch the related records needed for common chat questions in one database call.
+
+## Input
+- query: Client number, name, trading name, ABN/ACN or postal-address text.
+- include_licences: Include related licences (default true).
+- include_devices: Include related devices and site locations (default false).
+- limit: Maximum related rows per section (default 50, max 500).
+
+## Output
+- client: The best-ranked client match, including the complete postal address.
+- licences/devices: Compact columnar data when requested.
+- *_total and *_truncated: Whether the related section was capped.`,
+    },
+    search_everything: {
+        summary: 'Ranked FTS search across clients, licences, sites and application text in one call. [primary]',
+        tags: ['primary', 'fts'],
+        fullDescription: `
+### [Search Everything]
+Search the main ACMA entities with deterministic ranking: exact ID/name, exact phrase, prefix, FTS match, then substring fallback.
+
+## Input
+- query: Free-text search phrase.
+- entity_types: Any of client, licence, site and application (default all).
+- include_related: Include a useful related-record count for each result.
+- limit: Maximum complete result size (default 100, max 500).
+- page_size / offset: Control the compact page returned now; later pages use get_result_page.
+
+## Output
+Lossless columnar results with entity type, ID, display text, match type, score and optional related count.`,
     },
     search_frequency_assignments: {
         summary: 'Search ordinary device assignments using an explicit Hz or MHz range, optionally by state. [primary]',
@@ -597,6 +635,7 @@ const DB_TOOLS = new Set([
     'search_bsl', 'search_spectrum_band', 'search_application_text',
     'describe_schema', 'explain_query', 'execute_sql', 'get_frequency_allocation',
     'search_devices_by_emission',
+    'lookup_client', 'search_everything',
 ]);
 
 function createServer(): Server {
@@ -670,6 +709,39 @@ function createServer(): Server {
                         ...PAGED_RESPONSE_OPTIONS,
                         query: { type: 'string', description: 'Name, client number, ABN/ACN, street, suburb, state or postcode' },
                         limit: { type: 'number', description: 'Max results (default 10)' },
+                    },
+                    required: ['query'],
+                },
+            },
+            {
+                name: 'lookup_client',
+                description: TOOL_DOCS.lookup_client!.summary,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        query: { type: 'string', description: 'Name, client number, ABN/ACN or postal-address text' },
+                        include_licences: { type: 'boolean', description: 'Include related licences (default true)' },
+                        include_devices: { type: 'boolean', description: 'Include related devices and sites (default false)' },
+                        limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Maximum related rows per section (default 50)' },
+                    },
+                    required: ['query'],
+                },
+            },
+            {
+                name: 'search_everything',
+                description: TOOL_DOCS.search_everything!.summary,
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        ...PAGED_RESPONSE_OPTIONS,
+                        query: { type: 'string', description: 'Free-text phrase, identifier, name or address' },
+                        entity_types: {
+                            type: 'array',
+                            items: { type: 'string', enum: ['client', 'licence', 'site', 'application'] },
+                            description: 'Entity types to search (default all)',
+                        },
+                        include_related: { type: 'boolean', description: 'Include related licence/device counts (default false)' },
+                        limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Maximum complete result size (default 100)' },
                     },
                     required: ['query'],
                 },
@@ -1043,6 +1115,59 @@ function createServer(): Server {
                         why: 'licences held by the first matching client',
                     }] : undefined;
                 const response = pagedSearchResponse(name, args ?? {}, rows, {}, hints);
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+            } finally { if (db.open) db.close(); }
+        }
+
+        if (name === 'lookup_client') {
+            const db = openDb();
+            try {
+                const result = lookupClient(
+                    db,
+                    args?.query as string,
+                    args?.include_licences !== false,
+                    args?.include_devices === true,
+                    (args?.limit as number) ?? 50
+                ) as any;
+                if (!result) {
+                    return { content: [{ type: 'text', text: JSON.stringify({ found: false, query: args?.query }) }] };
+                }
+                const response: Record<string, unknown> = {
+                    found: true,
+                    client: result.client,
+                    client_matches: result.client_matches,
+                };
+                if (result.licences) {
+                    response.licences = objectRowsToColumnar(result.licences);
+                    response.licences_total = result.licences_total;
+                    response.licences_truncated = result.licences_truncated;
+                }
+                if (result.devices) {
+                    response.devices = objectRowsToColumnar(result.devices);
+                    response.devices_total = result.devices_total;
+                    response.devices_truncated = result.devices_truncated;
+                }
+                return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+            } finally { if (db.open) db.close(); }
+        }
+
+        if (name === 'search_everything') {
+            const db = openDb();
+            try {
+                const entityTypes = Array.isArray(args?.entity_types)
+                    ? args.entity_types as SearchEntityType[]
+                    : undefined;
+                const rows = searchEverything(
+                    db,
+                    args?.query as string,
+                    entityTypes,
+                    args?.include_related === true,
+                    (args?.limit as number) ?? 100
+                );
+                const response = pagedSearchResponse(name, args ?? {}, rows as unknown as Array<Record<string, unknown>>, {
+                    query: args?.query,
+                    entity_types: entityTypes ?? ['client', 'licence', 'site', 'application'],
+                });
                 return { content: [{ type: 'text', text: JSON.stringify(response) }] };
             } finally { if (db.open) db.close(); }
         }
@@ -1523,7 +1648,7 @@ async function main() {
     const port = Number(PORT);
     const httpServer = app.listen(port, '0.0.0.0', () => {
         log.info(`ACMA RRL MCP Server v1.10.0 running on port ${port} at http://localhost:${port}/mcp`);
-        log.info('Tools: search_licences, get_licence_details, search_sites, get_site_details, search_clients, sync_data, execute_sql, list_sample_queries, export_kml, search_bsl, search_spectrum_band, search_application_text, get_frequency_allocation, describe_schema, describe_tool, explain_query, decode_emission_designator, search_devices_by_emission');
+        log.info('Tools: search_licences, get_licence_details, search_sites, get_site_details, search_clients, lookup_client, search_everything, sync_data, execute_sql, list_sample_queries, export_kml, get_result_page, search_bsl, search_spectrum_band, search_application_text, get_frequency_allocation, describe_schema, describe_tool, explain_query, decode_emission_designator, search_devices_by_emission');
     });
 
     // Graceful shutdown on SIGTERM (systemd / docker stop) and SIGINT (Ctrl-C).
