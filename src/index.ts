@@ -1,1266 +1,542 @@
-/**
- * ACMA RRL MCP Server - Network Mode
- *
- * Per-session StreamableHTTPServerTransport (official MCP multi-client pattern).
- * Full tool catalog: search_sites, search_licences, search_clients,
- *                    get_licence_details, get_site_details, sync_data,
- *                    execute_sql, list_sample_queries, export_kml,
- *                    search_bsl, search_spectrum_band, search_application_text,
- *                    describe_schema, describe_tool, explain_query,
- *                    get_frequency_allocation, decode_emission_designator,
- *                    search_devices_by_emission.
- */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import {
-    CallToolRequestSchema,
-    ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import Database from 'better-sqlite3';
-import { initializeDatabase } from './db.js';
-import { DEFAULT_CONFIG, sync, getSyncStatus } from './sync.js';
 import express from 'express';
 import { randomUUID } from 'node:crypto';
-import {
-    searchSites,
-    searchLicences,
-    searchClients,
-    getLicenceDetails,
-    getSiteDetails,
-    searchBsl,
-    searchSpectrumBand,
-    searchApplicationText,
-} from './logic.js';
-import { executeSqlWithTimeout, listSampleQueries, describeSchema, explainQuery } from './sql.js';
-import { generateKml } from './kml.js';
+import { initializeDatabase } from './db.js';
+import { DEFAULT_CONFIG, getSyncStatus, sync } from './sync.js';
+import { searchRecords, getRecord, type EntityType } from './search.js';
+import { parseFrequencyHz, searchFrequencies } from './frequency.js';
+import { ResultCache } from './result_cache.js';
 import { lookupFrequencyAllocation } from './spectrum_plan.js';
 import { decodeEmissionDesignator } from './emissions.js';
-import { searchDevicesByEmission } from './emissions_search.js';
+import { executeSqlWithTimeout, describeSchema } from './sql.js';
+import { generateKml } from './kml.js';
 import { log } from './logger.js';
 
+const VERSION = '2.0.0';
 const dbPath = process.env.ACMA_DB_PATH || DEFAULT_CONFIG.dbPath;
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const DEFAULT_PAGE_SIZE = Math.max(1, Math.min(100, Number(process.env.MCP_DEFAULT_PAGE_SIZE || 10)));
+const cache = new ResultCache();
+const transports = new Map<string, StreamableHTTPServerTransport>();
 
-// ─── Tool Documentation Map ───────────────────────────────────────────────────
+const ENTITY_TYPES: EntityType[] = [
+  'client', 'licence', 'callsign', 'device', 'site', 'broadcast', 'application',
+];
 
-interface ToolDoc {
-    summary: string;      // ≤150 chars; appears in tools/list
-    tags: string[];       // ['primary'], ['geospatial'], ['fts'], ['meta'], ['sync'], ['sql'], etc.
-    fullDescription: string;  // returned by describe_tool
-}
-
-export const TOOL_DOCS: Record<string, ToolDoc> = {
-    search_licences: {
-        summary: 'Search ACMA licences by licence number (substring match). [primary]',
-        tags: ['primary', 'sql'],
-        fullDescription: `
-### [Licence Search] PRIMARY SEARCH TOOL
-Search ACMA RRL licences by licence number.
-
-## Usage
-- Use this first when given a licence number (e.g. "1191324/1", "1191324")
-- Results include: LICENCE_NO, STATUS, LICENCE_TYPE_NAME, CLIENT_NO, DATE_OF_EXPIRY
-
-## Input
-- query: Licence number or partial number`,
-    },
-    get_licence_details: {
-        summary: 'Full licence record: holder + up to 50 devices with site coordinates.',
-        tags: ['lookup', 'geospatial-result'],
-        fullDescription: `
-### [Licence Details]
-Get full details for a specific licence: client info and all associated radio devices.
-
-## Usage
-- Use after finding a licence number via search_licences
-- Returns: licence record, client/owner info, up to 50 device records (with site coordinates)
-- If results contain geospatial data, a result_id is returned for optional KML export via export_kml
-
-## Input
-- licence_no: Exact licence number (e.g. "1191324/1")`,
-    },
-    search_sites: {
-        summary: 'Search transmission sites by name or postcode.',
-        tags: ['lookup', 'geospatial-result'],
-        fullDescription: `
-### [Site Search]
-Search transmission sites by site name or postcode.
-
-## Usage
-- Use when asked about a transmitter location or site
-- Results include: SITE_ID, NAME, STATE, POSTCODE, LATITUDE, LONGITUDE
-- A result_id is returned for optional KML export via export_kml
-
-## Input
-- query: Site name or postcode`,
-    },
-    get_site_details: {
-        summary: 'Full site record + up to 50 devices registered there.',
-        tags: ['lookup', 'geospatial-result'],
-        fullDescription: `
-### [Site Details]
-Get full details for a specific site including all devices registered at that site.
-
-## Usage
-- Use after finding a SITE_ID via search_sites
-- Returns: site record, up to 50 associated device_details records
-- A result_id is returned for optional KML export via export_kml
-
-## Input
-- site_id: Exact Site ID from site search results`,
-    },
-    search_clients: {
-        summary: 'Search licence holders (clients) by company name or trading name.',
-        tags: ['lookup'],
-        fullDescription: `
-### [Client / Licensee Search]
-Search for licence holders (clients) by company name or trading name.
-
-## Usage
-- Use when asked about who holds licences, e.g. "who operates on this frequency?"
-- Results include: CLIENT_NO, LICENCEE, TRADING_NAME, ABN, ACN, STATE
-
-## Input
-- query: Business name or trading name`,
-    },
-    search_bsl: {
-        summary: 'Search broadcasting service licences by call sign, BSL number, or on-air ID.',
-        tags: ['broadcasting'],
-        fullDescription: `
-### [Broadcasting Licence Search]
-Search broadcasting service licences (BSLs) by call sign, BSL number, or on-air ID.
-
-## Usage
-- Use for queries about broadcast/TV/radio operators (e.g. "what's the call sign for ABC Sydney?")
-- Results include: BSL_NO, CALL_SIGN, MEDIUM_CATEGORY, REGION_CATEGORY, BSL_STATE, DATE_COMMENCED, ON_AIR_ID, AREA_NAME
-
-## Input
-- query: CALL_SIGN, BSL_NO, or ON_AIR_ID`,
-    },
-    search_spectrum_band: {
-        summary: 'Find licences authorised in a frequency band (Hz).',
-        tags: ['spectrum'],
-        fullDescription: `
-### [Spectrum Authorisation Search]
-Find licences authorised in a frequency range. Frequencies are in Hertz (Hz).
-
-## Usage
-- Use for queries like "who's licenced between 1800 and 1900 MHz?"
-- Pass freq_min_hz and freq_max_hz; result rows overlap the requested range
-- Results include LICENCE_NO, AREA_NAME, frequency endpoints, CLIENT_NO
-
-## Input
-- freq_min_hz: Lower bound of the band, in Hz (e.g. 1800000000 for 1.8 GHz)
-- freq_max_hz: Upper bound of the band, in Hz`,
-    },
-    search_application_text: {
-        summary: 'FTS5 full-text search over licence application narrative.',
-        tags: ['fts'],
-        fullDescription: `
-### [Licence Application Text Search]
-Full-text search across licence application narrative (conditions, exemptions, special clauses).
-
-## Usage
-- Pass an FTS5 query string. Supports: phrase ("text in quotes"), AND/OR, NEAR/N, prefix*.
-- Results return APTB_ID, LICENCE_NO, APTB_CATEGORY, APTB_DESCRIPTION, a snippet with «match» markers, and a BM25 rank score (lower is better).
-- For full text of a matching APTB_ID, follow up with execute_sql: SELECT APTB_TEXT FROM applic_text_block WHERE APTB_ID = ...
-
-## Input
-- query: FTS5 query (e.g. 'aeronautical', '"marine emergency"', 'ICAO OR ITU')`,
-    },
-    sync_data: {
-        summary: 'Sync local RRL mirror. mode=auto applies incrementals; mode=full re-pulls the 70 MB extract.',
-        tags: ['sync'],
-        fullDescription: `
-### [Data Synchronization]
-Download and import the latest ACMA RRL changes. Safe to call while server is running.
-
-## Usage
-- Default mode='auto' applies incremental change-zips only (cheap, mobile-friendly).
-- Use mode='full' to force a full extract reimport (~70 MB) when 'gap-exceeded' is reported.
-- Call once to start sync, then poll to check progress.
-
-## Status fields
-- progress: 0-100%
-- currentTable: which CSV is being imported
-- dataAsOf: how fresh the local data is (ISO 8601)
-- remoteAsOf: latest available upstream (ISO 8601)
-- behindByHours: derived staleness; 0 when current`,
-    },
-    list_sample_queries: {
-        summary: '[SQL] List sample queries. Bare call returns category index; filter by category/name for details.',
-        tags: ['sql', 'meta'],
-        fullDescription: `
-### [SQL Sample Queries]
-Curated SQL examples grouped by category. Bare call returns a compact category index; filter to drill in.
-
-## Usage
-- Call once with no args to see categories and query descriptions
-- Then call with { category: "geospatial" } or { name: "NBN" } to fetch the SQL bodies
-
-## Categories
-- lookup: "All <table>" queries
-- statistics: counts and aggregates
-- geospatial: lat/lng and KML-friendly queries
-- text-search: applic_text_block / client / site text matches
-- power-user: CTE templates and advanced joins
-- data-dict: sqlite_master introspection`,
-    },
-    execute_sql: {
-        summary: '[SQL] Run a read-only SELECT/WITH query against the RRL database (max 500 rows).',
-        tags: ['sql'],
-        fullDescription: `
-### [SQL Query Executor]
-Run a read-only SELECT or WITH (CTE) query directly against the ACMA RRL SQLite database.
-
-## Usage
-- Use describe_schema to discover available tables and columns at runtime
-- Use list_sample_queries first if unsure what to query
-- Only SELECT/WITH statements are allowed — no INSERT, UPDATE, DELETE, DROP etc.
-- Results capped at 'limit' rows (default 100, max 500)
-- If results contain geospatial columns (LATITUDE/LONGITUDE or GEOMETRY), a result_id is returned for optional KML export via export_kml
-
-## Output
-{ columns: string[], rows: any[][], truncated: boolean, rowCount: number, result_id?: string, _hints?: ... }`,
-    },
-    export_kml: {
-        summary: '[KML] Render a previously-cached query result as a KML overlay.',
-        tags: ['geospatial'],
-        fullDescription: `
-### [KML Export]
-Generate a KML file from cached query results.
-
-## Usage
-- Call this AFTER running a query that returned a result_id (e.g. execute_sql, search_sites, get_site_details, get_licence_details)
-- Returns a KML <Placemark> collection ready to drop into Google Earth or any KML-aware viewer
-
-## Input
-- result_id: the result_id returned by the previous tool call`,
-    },
-    describe_schema: {
-        summary: '[Meta] Returns columns, indexes, row counts for one or more tables; omit `tables` for all.',
-        tags: ['meta', 'sql'],
-        fullDescription: `
-### [Schema Introspection]
-Runtime schema discovery. Returns columns + indexes + row counts for the named tables.
-
-## Usage
-- Call with no args to enumerate every materialised table
-- Pass { tables: ['licence', 'site'] } to drill in to specific tables
-- Virtual tables (e.g. applic_text_block_fts) appear with isVirtual: true
-
-## Output
-Array of { name, columns, indexes, rowCount, isVirtual } records.`,
-    },
-    describe_tool: {
-        summary: '[Meta] Returns the full markdown documentation for a tool by name.',
-        tags: ['meta'],
-        fullDescription: `
-### [Tool Documentation]
-Returns the verbose, full-markdown documentation for any tool advertised by this server.
-
-## Usage
-- tools/list gives a compact summary per tool
-- Call describe_tool({ name: 'search_licences' }) for the full description, including Usage notes, Input fields, and Output shape
-
-## Input
-- name: Exact tool name (case-sensitive)`,
-    },
-    explain_query: {
-        summary: '[SQL] Returns SQLite EXPLAIN QUERY PLAN output for a SELECT/WITH statement.',
-        tags: ['sql', 'meta'],
-        fullDescription: `
-### [Query Plan Explainer]
-Returns SQLite's EXPLAIN QUERY PLAN output for a read-only query.
-
-## Usage
-- Pass a SELECT or WITH ... SELECT statement
-- Returns plan rows with { id, parent, notused, detail }
-- Use to understand index choices, scan vs lookup, join order
-
-## Input
-- sql: A SELECT or WITH ... SELECT statement (same restrictions as execute_sql)`,
-    },
-    get_frequency_allocation: {
-        summary: 'Look up ACMA Spectrum Plan allocation for a frequency (Hz). Returns AU allocation + R1/R2/R3 contrast + resolved footnotes. [capability: lookup]',
-        tags: ['lookup', 'spectrum'],
-        fullDescription: `
-### [Spectrum Allocation Lookup]
-Look up the Australian Radiofrequency Spectrum Plan (ARSP) allocation for a given frequency,
-with ITU Region 1/2/3 contrast and resolved footnote text.
-
-## Input
-- \`freq_hz\` — Positive integer or float, in Hz. Examples:
-  - \`87100000\` → 87.1 MHz (FM broadcast band)
-  - \`2400000000\` → 2.4 GHz (ISM band)
-  - \`14000000\` → 14 MHz (amateur 20 m band)
-- \`include_footnotes\` — Boolean, default \`true\`. When false, \`resolved_footnotes\` is omitted (faster).
-
-## Response shape
-
-| Field | Type | Description |
-|-------|------|-------------|
-| \`match_count\` | number | Number of AU allocations covering this frequency. Normally 0 or 1; >1 indicates a plan overlap and triggers a \`_warning\`. |
-| \`allocation\` | object\|null | The AU allocation row covering the frequency, or \`null\` when nothing matches. |
-| \`regions\` | object | ITU R1/R2/R3 contrast. Keys \`"1"\`, \`"2"\`, \`"3"\`; each value is an allocation row or \`null\`. |
-| \`resolved_footnotes\` | object | Flat map of \`footnote_ref → footnote_text\` covering all refs in \`allocation\` + all \`regions\`. Omitted when \`include_footnotes=false\`. |
-| \`source\` | object | \`{ published_date, last_patch_date }\` — provenance from \`spectrum_plan_meta\`. |
-| \`_warning\` | string | Staleness or integrity notice. Present when base data is ≥ 3 years old, no match found, or >1 overlapping rows detected. Absent otherwise. |
-| \`_hints\` | array | Cross-link suggestions. Present when \`match_count > 0\`. |
-
-### Allocation / region row fields
-
-Each \`allocation\` row (and each non-null \`regions[n]\` row) contains:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| \`freq_start_hz\` | number | Band start in Hz. |
-| \`freq_end_hz\` | number | Band end in Hz (exclusive). |
-| \`unit\` | string | Display unit from the plan table (e.g. \`"MHz"\`). |
-| \`page\` | number | Source page in the ARSP document. |
-| \`services\` | array | Parsed service entries (see below). |
-| \`footnotes\` | string[] | Cell-level footnote refs (e.g. \`["AUS37","5.87"]\`). |
-| \`raw\` | string | Original table-cell text (unparsed). |
-| \`region\` | number | Present only on region rows (1, 2, or 3). Absent on \`allocation\`. |
-
-### Service entry fields
-
-Each \`services[]\` element:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| \`name\` | string | Service name as it appears in the plan (e.g. \`"BROADCASTING"\`). |
-| \`primary\` | boolean | \`true\` when the service is written ALL CAPS in the plan, indicating a primary allocation basis. \`false\` for secondary (mixed case). |
-| \`inline_footnotes\` | string[] | Footnote refs that appeared inline with this service entry. |
-| \`qualifier\` | string | Optional qualifier text (e.g. \`"(Earth-to-space)"\`). Absent when none. |
-
-## Example
-
-**Call:**
-\`\`\`json
-{ "name": "get_frequency_allocation", "arguments": { "freq_hz": 87100000 } }
-\`\`\`
-
-**Response (truncated):**
-\`\`\`json
-{
-  "match_count": 1,
-  "allocation": {
-    "freq_start_hz": 87000000,
-    "freq_end_hz": 108000000,
-    "unit": "MHz",
-    "page": 42,
-    "services": [
-      { "name": "BROADCASTING", "primary": true, "inline_footnotes": ["AUS37"] }
-    ],
-    "footnotes": ["AUS37", "5.87"],
-    "raw": "BROADCASTING AUS37"
+export const TOOL_DOCS = {
+  search_records: {
+    summary: 'Search names, addresses, clients, licences, call signs, device IDs, sites, broadcasts and application text.',
   },
-  "regions": {
-    "1": { "freq_start_hz": 87500000, "freq_end_hz": 108000000, "services": [...], "region": 1, ... },
-    "2": { "freq_start_hz": 87500000, "freq_end_hz": 108000000, "services": [...], "region": 2, ... },
-    "3": null
+  get_record: {
+    summary: 'Open one search result and return its database record plus useful related licences or assignments.',
   },
-  "resolved_footnotes": {
-    "AUS37": "AUS37 — The frequency band 87–108 MHz ...",
-    "5.87": "5.87 — In the band 87.5–108 MHz ..."
+  search_frequencies: {
+    summary: 'Find exact or ranged frequency assignments. Accepts Hz, kHz, MHz or GHz; 476.425 auto-means MHz.',
   },
-  "source": { "published_date": "2021-06-24", "last_patch_date": null },
-  "_hints": [
-    { "tool": "search_licences", "why": "find licences operating in this band" },
-    { "tool": "search_application_text", "why": "search application text for this band's usage" }
-  ]
-}
-\`\`\`
+  spectrum_reference: {
+    summary: 'Look up the Australian and ITU spectrum-plan allocation covering one frequency.',
+  },
+  decode_emission: {
+    summary: 'Decode an emission designator such as 16K0F3E.',
+  },
+  database: {
+    summary: 'Advanced fallback: inspect the schema or run a read-only SQL query when the search tools cannot answer.',
+  },
+  get_result_page: {
+    summary: 'Read another page from a previous search result without repeating the database query.',
+  },
+  export_kml: {
+    summary: 'Turn a cached result containing latitude and longitude into KML.',
+  },
+  sync_data: {
+    summary: 'Check sync status or start an automatic/full ACMA data sync.',
+  },
+} as const;
 
-## Notes
-- The plan is updated by legislative amendment; consult the current legislation for any licensing decision.
-- When \`include_footnotes=false\`, the response is faster but \`resolved_footnotes\` is absent.
-- \`_warning\` is added when the base data is ≥ 3 years old; verify against the current legislation before any licensing decision.`,
-    },
-    decode_emission_designator: {
-        summary: 'Decode an ITU/ACA emission designator (e.g. 16K0F3E) into bandwidth, modulation, signal nature, info type and optional details. [reference]',
-        tags: ['reference', 'emission'],
-        fullDescription: `
-### [Decode Emission Designator]
-Decode an ITU/ACA emission designator (the 7- or 9-character code stored in \`device_details.EMISSION\`) into structured fields.
-
-## Usage
-- Pass the raw designator string. Trailing whitespace is tolerated.
-- Returns parsed bandwidth (Hz + display), modulation, signal nature, info type, and (when present) signal detail + multiplex.
-
-## Input
-- code: e.g. "16K0F3E" (classic FM telephony), "10M0W7D" (combined-mode digital data), "19M8W7DEW" (9-char form with optional fields).
-
-## Output
-- valid: true if bandwidth parsed AND all three required body codes are known. Optional codes are recorded as warnings, not errors.
-- warnings[]: non-fatal observations (whitespace, unknown optional codes, length mismatch).
-- _hints: includes a search_devices_by_emission call with the parsed modulation + info_type prefilled, so finding every device matching the same emission is one click away.
-
-## Notes
-- The decoder is the inverse of search_devices_by_emission: one designator → many fields; use search_devices_by_emission to go the other way (one filter → many devices).
-- Codes are per the ACA "Emission characteristics of radio transmissions" booklet (ITU worldwide standard, 1982).`,
-    },
-    search_devices_by_emission: {
-        summary: 'Find devices/licences whose emission designator matches decoded filters (modulation, info type, etc.) — accepts code letters or descriptions. [search]',
-        tags: ['search', 'emission'],
-        fullDescription: `
-### [Search Devices by Emission]
-Find device_details rows whose EMISSION designator matches one or more decoded descriptors.
-
-## Usage
-- Each filter may be a code letter (e.g. \`modulation: 'F'\`) OR a description substring (e.g. \`modulation: 'frequency modulation'\`, or just \`'frequency'\`).
-- At least one filter is required.
-- Description substring is matched case-insensitively against the relevant emission_* lookup table.
-- If a description resolves to zero or more than one code, the tool returns an explicit \`_error\` listing the candidates rather than silently picking one.
-
-## Input
-- modulation:     code letter or description substring (e.g. 'F', 'frequency', 'reduced').
-- signal_nature:  code digit or description substring (e.g. '3', 'single channel analogue').
-- info_type:      code letter or description substring (e.g. 'C', 'facsimile', 'telephony').
-- signal_detail:  optional. Code letter or description substring.
-- multiplex:      optional. Code letter or description substring.
-- min_bandwidth_hz, max_bandwidth_hz: bandwidth bounds in Hz. Devices with unparseable EMISSION are excluded when these are set.
-- licence_no:     restrict to one licence.
-- state:          state code from the joined site row (e.g. 'NSW', 'QLD').
-- limit:          default 100, max 500.
-
-## Output
-- rows[]: each row carries LICENCE_NO, CLIENT_NO, FREQUENCY, EMISSION, decoded summary (modulation/info-type descriptions, parsed bandwidth), SITE_ID, STATE, and transmitter power.
-- resolved_filters: echoes back the codes the handler actually matched on — useful when you passed a description.
-- _hints: links to get_licence_details for the first row, decode_emission_designator for full breakdowns, and execute_sql for aggregation.
-
-## Notes
-- Description-only resolution is the common case; you don't need to memorise that R = SSB-reduced-carrier or C = facsimile.
-- For aggregate questions ("most common modulation across all devices"), use execute_sql with SUBSTR + emission_modulation join — see list_sample_queries.`,
-    },
-};
-
-// ─── Result Cache ────────────────────────────────────────────────────────────
-// Caches query results (columns + rows) so KML can be generated on demand
-// without re-running the query. 30-minute TTL.
-
-interface CachedResult {
-    columns: string[];
-    rows: unknown[][];
-    expires: number;
+function openDb(): Database.Database {
+  return new Database(dbPath, { readonly: true, fileMustExist: true });
 }
 
-const resultCache = new Map<string, CachedResult>();
-
-function cacheResult(columns: string[], rows: unknown[][]): string {
-    const id = randomUUID();
-    resultCache.set(id, { columns, rows, expires: Date.now() + 30 * 60 * 1000 });
-    return id;
+function json(value: unknown): string {
+  return JSON.stringify(value);
 }
 
-// Cleanup expired results every 5 mins
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, entry] of resultCache.entries()) {
-        if (now > entry.expires) resultCache.delete(id);
-    }
-}, 300_000).unref();
-
-/**
- * Detects whether a result set contains geospatial data (lat/lng or geometry columns).
- */
-function hasGeospatialData(columns: string[]): boolean {
-    const lCols = columns.map(c => c.toLowerCase());
-    const hasLatLng = lCols.includes('latitude') && lCols.includes('longitude');
-    const hasGeometry = lCols.includes('geometry');
-    return hasLatLng || hasGeometry;
+function error(message: string) {
+  return {
+    content: [{ type: 'text' as const, text: json({ error: message }) }],
+    isError: true,
+  };
 }
 
-// ─── DB Helper ───────────────────────────────────────────────────────────────
+function response(tool: string, started: number, value: unknown, rows = 0, cached = false) {
+  const output = json(value);
+  log.info(
+    `[MCP] tool=${tool} db_ms=${Math.round(performance.now() - started)} ` +
+    `rows=${rows} output_bytes=${Buffer.byteLength(output)} cached=${cached}`
+  );
+  return { content: [{ type: 'text' as const, text: output }] };
+}
 
-function openDb() {
-    return new Database(dbPath, { readonly: true });
+function pageSize(args: Record<string, unknown> | undefined): number {
+  const value = Number(args?.page_size);
+  if (!Number.isFinite(value)) return DEFAULT_PAGE_SIZE;
+  return Math.max(1, Math.min(100, Math.trunc(value)));
 }
 
 function createServer(): Server {
-    const server = new Server(
-        { name: 'acma-rrl-server', version: '1.10.0' },
-        { capabilities: { tools: {} } }
-    );
+  const server = new Server(
+    { name: 'acma-rrl-server', version: VERSION },
+    { capabilities: { tools: {} } }
+  );
 
-    // ─── Tool Catalog ───────────────────────────────────────────────────────────
-
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: [
-            {
-                name: 'search_licences',
-                description: TOOL_DOCS.search_licences!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        query: { type: 'string', description: 'Licence number or partial number, e.g. "1191324"' },
-                        limit: { type: 'number', description: 'Max results (default 10)' },
-                    },
-                    required: ['query'],
-                },
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: 'search_records',
+        description: TOOL_DOCS.search_records.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Name, address, licence/client number, ABN/ACN, call sign, device ID, site or text.',
             },
-            {
-                name: 'get_licence_details',
-                description: TOOL_DOCS.get_licence_details!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        licence_no: { type: 'string', description: 'Exact licence number, e.g. "1191324/1"' },
-                    },
-                    required: ['licence_no'],
-                },
+            entity_types: {
+              type: 'array',
+              items: { type: 'string', enum: ENTITY_TYPES },
+              description: 'Optional categories. Use application explicitly for narrative full-text search.',
             },
-            {
-                name: 'search_sites',
-                description: TOOL_DOCS.search_sites!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        query: { type: 'string', description: 'Site name or postcode' },
-                        limit: { type: 'number', description: 'Max results (default 10)' },
-                    },
-                    required: ['query'],
-                },
+            limit: {
+              type: 'integer',
+              description: 'Total matches to retain for paging (default 50, max 500).',
             },
-            {
-                name: 'get_site_details',
-                description: TOOL_DOCS.get_site_details!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        site_id: { type: 'string', description: 'Site ID, e.g. "124"' },
-                    },
-                    required: ['site_id'],
-                },
+            page_size: {
+              type: 'integer',
+              description: 'Rows returned now (default 10, max 100).',
             },
-            {
-                name: 'search_clients',
-                description: TOOL_DOCS.search_clients!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        query: { type: 'string', description: 'Licensee or trading name' },
-                        limit: { type: 'number', description: 'Max results (default 10)' },
-                    },
-                    required: ['query'],
-                },
+          },
+          required: ['query'],
+        },
+      },
+      {
+        name: 'get_record',
+        description: TOOL_DOCS.get_record.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entity_type: { type: 'string', enum: ENTITY_TYPES },
+            id: {
+              type: 'string',
+              description: 'ENTITY_ID from search_records. A plain exact call sign also works.',
             },
-            {
-                name: 'search_bsl',
-                description: TOOL_DOCS.search_bsl!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        query: { type: 'string', description: 'CALL_SIGN, BSL_NO, or ON_AIR_ID' },
-                        limit: { type: 'number', description: 'Max rows (default 10)' },
-                    },
-                    required: ['query'],
-                },
+            include_related: {
+              type: 'boolean',
+              description: 'Include linked licences or assignments (default true).',
             },
-            {
-                name: 'search_spectrum_band',
-                description: TOOL_DOCS.search_spectrum_band!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        freq_min_hz: { type: 'number', description: 'Lower bound (Hz)' },
-                        freq_max_hz: { type: 'number', description: 'Upper bound (Hz)' },
-                        limit:       { type: 'number', description: 'Max rows (default 20)' },
-                    },
-                    required: ['freq_min_hz', 'freq_max_hz'],
-                },
+            related_limit: {
+              type: 'integer',
+              description: 'Maximum linked rows (default 20, max 100).',
             },
-            {
-                name: 'search_application_text',
-                description: TOOL_DOCS.search_application_text!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        query: { type: 'string', description: 'FTS5 query string' },
-                        limit: { type: 'number', description: 'Max rows (default 20)' },
-                    },
-                    required: ['query'],
-                },
+          },
+          required: ['entity_type', 'id'],
+        },
+      },
+      {
+        name: 'search_frequencies',
+        description: TOOL_DOCS.search_frequencies.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            frequency: {
+              oneOf: [{ type: 'number' }, { type: 'string' }],
+              description: 'Examples: 476.425, "476.425 MHz", or 476425000.',
             },
-            {
-                name: 'sync_data',
-                description: TOOL_DOCS.sync_data!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        mode: {
-                            type: 'string',
-                            enum: ['auto', 'full'],
-                            description:
-                                "'auto' (default) applies incremental change-zips only. " +
-                                "'full' force-pulls and reimports the ~70 MB full extract — " +
-                                "use after a long offline period or to recover from gap-exceeded.",
-                        },
-                    },
-                },
+            unit: {
+              type: 'string',
+              enum: ['auto', 'Hz', 'kHz', 'MHz', 'GHz'],
+              description: 'Default auto: values under 1,000,000 mean MHz; larger values mean Hz.',
             },
-            {
-                name: 'list_sample_queries',
-                description: TOOL_DOCS.list_sample_queries!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        category: {
-                            type: 'string',
-                            enum: ['lookup', 'statistics', 'geospatial', 'text-search', 'power-user', 'data-dict'],
-                            description: 'Filter to one category',
-                        },
-                        name: {
-                            type: 'string',
-                            description: 'Substring match on description',
-                        },
-                    },
-                },
+            to_frequency: {
+              oneOf: [{ type: 'number' }, { type: 'string' }],
+              description: 'Optional upper end of a range, using the same unit.',
             },
-            {
-                name: 'describe_schema',
-                description: TOOL_DOCS.describe_schema!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        tables: {
-                            type: 'array',
-                            items: { type: 'string' },
-                            description: 'Optional list of table names (case-insensitive); omit for all.',
-                        },
-                    },
-                },
+            tolerance_hz: {
+              type: 'number',
+              description: 'Optional tolerance around the requested value. Default 0 means exact only.',
             },
-            {
-                name: 'explain_query',
-                description: TOOL_DOCS.explain_query!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        sql: { type: 'string', description: 'A SELECT or WITH ... SELECT statement' },
-                    },
-                    required: ['sql'],
-                },
+            scope: {
+              type: 'string',
+              enum: ['assignments', 'authorisations', 'all'],
+              description: 'Default assignments searches device frequencies.',
             },
-            {
-                name: 'execute_sql',
-                description: TOOL_DOCS.execute_sql!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        sql: {
-                            type: 'string',
-                            description: 'A SELECT SQL query to run against the ACMA RRL database',
-                        },
-                        limit: {
-                            type: 'number',
-                            description: 'Max rows to return (default 100, max 500)',
-                        },
-                    },
-                    required: ['sql'],
-                },
+            limit: {
+              type: 'integer',
+              description: 'Total matches retained for paging (default 50, max 500).',
             },
-            {
-                name: 'export_kml',
-                description: TOOL_DOCS.export_kml!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        result_id: { type: 'string', description: 'The result_id from a previous query response' },
-                    },
-                    required: ['result_id'],
-                },
+            page_size: {
+              type: 'integer',
+              description: 'Rows returned now (default 10, max 100).',
             },
-            {
-                name: 'describe_tool',
-                description: TOOL_DOCS.describe_tool!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        name: { type: 'string', description: 'Exact tool name (case-sensitive)' },
-                    },
-                    required: ['name'],
-                },
+          },
+          required: ['frequency'],
+        },
+      },
+      {
+        name: 'spectrum_reference',
+        description: TOOL_DOCS.spectrum_reference.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            frequency: {
+              oneOf: [{ type: 'number' }, { type: 'string' }],
+              description: 'Examples: 87.1, "87.1 MHz", or 87100000.',
             },
-            {
-                name: 'get_frequency_allocation',
-                description: TOOL_DOCS.get_frequency_allocation!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        freq_hz: {
-                            type: 'number',
-                            description: 'Frequency in Hz. Examples: 87100000 (87.1 MHz), 2400000000 (2.4 GHz).',
-                        },
-                        include_footnotes: {
-                            type: 'boolean',
-                            description: 'If true (default), include full footnote text.',
-                        },
-                    },
-                    required: ['freq_hz'],
-                },
+            unit: {
+              type: 'string',
+              enum: ['auto', 'Hz', 'kHz', 'MHz', 'GHz'],
             },
-            {
-                name: 'decode_emission_designator',
-                description: TOOL_DOCS.decode_emission_designator!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        code: { type: 'string', description: 'Emission designator, e.g. 16K0F3E or 10M0W7D' },
-                    },
-                    required: ['code'],
-                },
+            include_footnotes: {
+              type: 'boolean',
+              description: 'Include resolved footnote text (default false for speed).',
             },
-            {
-                name: 'search_devices_by_emission',
-                description: TOOL_DOCS.search_devices_by_emission!.summary,
-                inputSchema: {
-                    type: 'object',
-                    properties: {
-                        modulation:       { type: 'string', description: "Code letter (e.g. 'R', 'F') or description substring (e.g. 'reduced', 'frequency modulation')" },
-                        signal_nature:    { type: 'string', description: "Code digit (e.g. '3') or description substring" },
-                        info_type:        { type: 'string', description: "Code letter (e.g. 'C', 'E') or description substring (e.g. 'facsimile', 'telephony')" },
-                        signal_detail:    { type: 'string', description: 'Optional. Code letter or description substring.' },
-                        multiplex:        { type: 'string', description: 'Optional. Code letter or description substring.' },
-                        min_bandwidth_hz: { type: 'number',  description: 'Lower bound on parsed bandwidth (inclusive).' },
-                        max_bandwidth_hz: { type: 'number',  description: 'Upper bound on parsed bandwidth (inclusive).' },
-                        licence_no:       { type: 'string',  description: 'Restrict to one licence.' },
-                        state:            { type: 'string',  description: "State code from the joined site row (e.g. 'NSW')." },
-                        limit:            { type: 'integer', description: 'Default 100, max 500.' },
-                    },
-                },
+          },
+          required: ['frequency'],
+        },
+      },
+      {
+        name: 'decode_emission',
+        description: TOOL_DOCS.decode_emission.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', description: 'Emission designator, for example 16K0F3E.' },
+          },
+          required: ['code'],
+        },
+      },
+      {
+        name: 'database',
+        description: TOOL_DOCS.database.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['schema', 'query'] },
+            tables: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'For schema: optional table names.',
             },
-        ],
-    }));
+            sql: {
+              type: 'string',
+              description: 'For query: one read-only SELECT or WITH statement.',
+            },
+            limit: {
+              type: 'integer',
+              description: 'For query: maximum rows retained (default 100, max 500).',
+            },
+            page_size: {
+              type: 'integer',
+              description: 'For query: rows returned now (default 10, max 100).',
+            },
+          },
+          required: ['action'],
+        },
+      },
+      {
+        name: 'get_result_page',
+        description: TOOL_DOCS.get_result_page.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            result_id: { type: 'string' },
+            offset: { type: 'integer', description: 'Zero-based row offset.' },
+            limit: { type: 'integer', description: 'Rows to return (default 10, max 500).' },
+          },
+          required: ['result_id'],
+        },
+      },
+      {
+        name: 'export_kml',
+        description: TOOL_DOCS.export_kml.summary,
+        inputSchema: {
+          type: 'object',
+          properties: { result_id: { type: 'string' } },
+          required: ['result_id'],
+        },
+      },
+      {
+        name: 'sync_data',
+        description: TOOL_DOCS.sync_data.summary,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            mode: { type: 'string', enum: ['status', 'auto', 'full'] },
+          },
+        },
+      },
+    ],
+  }));
 
-    // ─── Tool Handlers ──────────────────────────────────────────────────────────
+  server.setRequestHandler(CallToolRequestSchema, async request => {
+    const started = performance.now();
+    const name = request.params.name;
+    const args = (request.params.arguments ?? {}) as Record<string, any>;
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const { name, arguments: args } = request.params;
-
-        if (name === 'search_licences') {
-            const db = openDb();
-            try {
-                const rows = searchLicences(db, args?.query as string, (args?.limit as number) ?? 10) as any[];
-                const envelope: any = { rows };
-                if (rows.length > 0 && rows[0]?.LICENCE_NO) {
-                    envelope._hints = [{
-                        tool: 'get_licence_details',
-                        args: { licence_no: rows[0].LICENCE_NO },
-                        why: 'devices + holder for the first result',
-                    }];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
-            } finally { if (db.open) db.close(); }
+    try {
+      if (name === 'search_records') {
+        const db = openDb();
+        let rows;
+        try {
+          rows = searchRecords(db, {
+            query: args.query,
+            entity_types: args.entity_types,
+            limit: args.limit ?? 50,
+          });
+        } finally {
+          db.close();
         }
+        const stored = cache.putObjects(name, {
+          query: args.query,
+          entity_types: args.entity_types ?? null,
+          limit: args.limit ?? 50,
+        }, rows as any[]);
+        const page = cache.page(stored.entry, 0, pageSize(args));
+        if (stored.duplicate) page.duplicate = true;
+        return response(name, started, page, rows.length, stored.duplicate);
+      }
 
-        if (name === 'get_licence_details') {
-            const db = openDb();
-            try {
-                const result = getLicenceDetails(db, args?.licence_no as string);
-                if (!result) return { content: [{ type: 'text', text: `No licence found for: ${args?.licence_no}` }] };
-
-                // Cache devices for potential KML export (devices now include site coords)
-                let resultId: string | undefined;
-                if (result.devices.length > 0) {
-                    const columns = Object.keys(result.devices[0] as object);
-                    if (hasGeospatialData(columns)) {
-                        const rows = result.devices.map(r => columns.map(c => (r as any)[c]));
-                        resultId = cacheResult(columns, rows);
-                    }
-                }
-
-                const response: any = { ...result };
-                if (resultId) response.result_id = resultId;
-                if (resultId && (result.devices as any[]).some((d: any) => d.LATITUDE != null && d.LONGITUDE != null)) {
-                    response._hints = [{
-                        tool: 'export_kml',
-                        args: { result_id: resultId },
-                        why: 'render geospatially',
-                    }];
-                }
-
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
-            } finally { if (db.open) db.close(); }
+      if (name === 'get_record') {
+        if (!ENTITY_TYPES.includes(args.entity_type)) return error('Invalid entity_type.');
+        const db = openDb();
+        let result;
+        try {
+          result = getRecord(
+            db,
+            args.entity_type,
+            args.id,
+            args.include_related !== false,
+            args.related_limit ?? 20
+          );
+        } finally {
+          db.close();
         }
+        if (!result) return error(`No ${args.entity_type} record found for ${args.id}.`);
+        return response(name, started, result, 1);
+      }
 
-        if (name === 'search_sites') {
-            const db = openDb();
-            try {
-                const rows = searchSites(db, args?.query as string, (args?.limit as number) ?? 10) as any[];
-
-                // Cache results for potential KML export
-                let resultId: string | undefined;
-                if (rows.length > 0) {
-                    const columns = Object.keys(rows[0] as object);
-                    if (hasGeospatialData(columns)) {
-                        const rowArrays = rows.map(r => columns.map(c => (r as any)[c]));
-                        resultId = cacheResult(columns, rowArrays);
-                    }
-                }
-
-                const envelope: any = { rows };
-                if (resultId) envelope.result_id = resultId;
-                if (rows.length > 0) {
-                    envelope._hints = [{
-                        tool: 'get_site_details',
-                        args: { site_id: String(rows[0].SITE_ID) },
-                        why: 'devices at this site',
-                    }];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
-            } finally { if (db.open) db.close(); }
+      if (name === 'search_frequencies') {
+        const db = openDb();
+        let result;
+        try {
+          result = searchFrequencies(db, {
+            frequency: args.frequency,
+            unit: args.unit ?? 'auto',
+            to_frequency: args.to_frequency,
+            tolerance_hz: args.tolerance_hz,
+            scope: args.scope ?? 'assignments',
+            limit: args.limit ?? 50,
+          });
+        } finally {
+          db.close();
         }
+        const stored = cache.putObjects(name, {
+          frequency: args.frequency,
+          unit: args.unit ?? 'auto',
+          to_frequency: args.to_frequency ?? null,
+          tolerance_hz: args.tolerance_hz ?? 0,
+          scope: args.scope ?? 'assignments',
+          limit: args.limit ?? 50,
+        }, result.rows as any[]);
+        const page = cache.page(stored.entry, 0, pageSize(args));
+        const payload = { query: result.query, ...page, ...(stored.duplicate ? { duplicate: true } : {}) };
+        return response(name, started, payload, result.rows.length, stored.duplicate);
+      }
 
-        if (name === 'get_site_details') {
-            const db = openDb();
-            try {
-                const result = getSiteDetails(db, args?.site_id as string);
-                if (!result) return { content: [{ type: 'text', text: `No site found for ID: ${args?.site_id}` }] };
-
-                // Cache site record for potential KML export
-                let resultId: string | undefined;
-                const columns = Object.keys(result.site as object);
-                if (hasGeospatialData(columns)) {
-                    const rows = [columns.map(c => (result.site as any)[c])];
-                    resultId = cacheResult(columns, rows);
-                }
-
-                const response: any = { ...result };
-                if (resultId) response.result_id = resultId;
-                if (resultId) {
-                    response._hints = [{
-                        tool: 'export_kml',
-                        args: { result_id: resultId },
-                        why: 'render geospatially',
-                    }];
-                }
-
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
-            } finally { if (db.open) db.close(); }
+      if (name === 'spectrum_reference') {
+        const hz = parseFrequencyHz(args.frequency, args.unit ?? 'auto');
+        const db = openDb();
+        let result;
+        try {
+          result = lookupFrequencyAllocation(db, hz, args.include_footnotes === true);
+        } finally {
+          db.close();
         }
+        return response(name, started, { frequency_hz: hz, ...result }, result.match_count);
+      }
 
-        if (name === 'search_clients') {
-            const db = openDb();
-            try {
-                const results = searchClients(db, args?.query as string, (args?.limit as number) ?? 10);
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
-            } finally { if (db.open) db.close(); }
+      if (name === 'decode_emission') {
+        if (typeof args.code !== 'string') return error('code must be a string.');
+        return response(name, started, decodeEmissionDesignator(args.code), 1);
+      }
+
+      if (name === 'database') {
+        if (args.action === 'schema') {
+          const db = openDb();
+          let result;
+          try {
+            result = describeSchema(db, args.tables);
+          } finally {
+            db.close();
+          }
+          return response(name, started, result, Array.isArray(result) ? result.length : 1);
         }
-
-        if (name === 'search_bsl') {
-            const db = openDb();
-            try {
-                const results = searchBsl(db, args?.query as string, (args?.limit as number) ?? 10);
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
-            } finally { if (db.open) db.close(); }
+        if (args.action === 'query') {
+          if (typeof args.sql !== 'string') return error('sql is required when action=query.');
+          const result = await executeSqlWithTimeout(dbPath, args.sql, args.limit ?? 100, 25_000);
+          const stored = cache.put(name, {
+            sql: args.sql,
+            limit: args.limit ?? 100,
+          }, result.columns, result.rows);
+          const page = cache.page(stored.entry, 0, pageSize(args));
+          if (stored.duplicate) page.duplicate = true;
+          return response(name, started, page, result.rowCount, stored.duplicate);
         }
+        return error('action must be schema or query.');
+      }
 
-        if (name === 'search_spectrum_band') {
-            const db = openDb();
-            try {
-                const results = searchSpectrumBand(
-                    db,
-                    args?.freq_min_hz as number,
-                    args?.freq_max_hz as number,
-                    (args?.limit as number) ?? 20
-                );
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
-            } finally { db.close(); }
+      if (name === 'get_result_page') {
+        const entry = cache.get(args.result_id);
+        if (!entry) return error('Result not found or expired. Run the search again.');
+        const page = cache.page(entry, args.offset ?? 0, args.limit ?? DEFAULT_PAGE_SIZE);
+        return response(name, started, page, page.returned, true);
+      }
+
+      if (name === 'export_kml') {
+        const entry = cache.get(args.result_id);
+        if (!entry) return error('Result not found or expired. Run the search again.');
+        const kml = generateKml(entry.columns, entry.rows);
+        log.info(
+          `[MCP] tool=${name} db_ms=${Math.round(performance.now() - started)} ` +
+          `rows=${entry.rows.length} output_bytes=${Buffer.byteLength(kml)} cached=true`
+        );
+        return { content: [{ type: 'text' as const, text: kml }] };
+      }
+
+      if (name === 'sync_data') {
+        const mode = args.mode ?? 'status';
+        if (mode !== 'status' && !getSyncStatus().isSyncing) {
+          sync(DEFAULT_CONFIG, mode === 'full' ? 'full' : 'auto').catch(errorValue => {
+            log.error('[SYNC] Background failure:', errorValue);
+          });
         }
+        return response(name, started, getSyncStatus(), 1);
+      }
 
-        if (name === 'search_application_text') {
-            const db = openDb();
-            try {
-                const rows = searchApplicationText(
-                    db,
-                    args?.query as string,
-                    (args?.limit as number) ?? 20
-                ) as any[];
-                const envelope: any = { rows };
-                if (rows.length > 0 && rows[0]?.APTB_ID != null) {
-                    envelope._hints = [{
-                        tool: 'execute_sql',
-                        args: { sql: `SELECT APTB_TEXT FROM applic_text_block WHERE APTB_ID = ${rows[0].APTB_ID}` },
-                        why: 'full text for the first result',
-                    }];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }] };
-            } finally { db.close(); }
-        }
+      return error(`Unknown tool: ${name}`);
+    } catch (errorValue) {
+      const message = errorValue instanceof Error ? errorValue.message : String(errorValue);
+      log.error(`[MCP] tool=${name} failed: ${message}`);
+      return error(message);
+    }
+  });
 
-        if (name === 'sync_data') {
-            // Trigger the sync (mode defaults to 'auto'). Fire-and-forget; the
-            // user polls by calling sync_data again to read getSyncStatus().
-            const mode = args?.['mode'] === 'full' ? 'full' : 'auto';
-            const wasSyncing = getSyncStatus().isSyncing;
-            let launched = false;
-            if (!wasSyncing) {
-                // Kick off async; intentionally not awaited so this response is fast.
-                sync(DEFAULT_CONFIG, mode).catch((e: unknown) => {
-                    log.error('[MCP] sync_data background failure:', e);
-                });
-                launched = true;
-            }
-
-            const status = getSyncStatus();
-            const decisionLine = status.reason
-                ? `Last decision: ${status.mode ? `${status.mode} sync — ` : ''}${status.reason}` +
-                  (status.detail ? ` (${status.detail})` : '') +
-                  (status.lastDecisionAt ? ` at ${status.lastDecisionAt}` : '')
-                : null;
-
-            const freshness: string[] = [];
-            if (status.dataAsOf) freshness.push(`dataAsOf: ${status.dataAsOf}`);
-            if (status.remoteAsOf) freshness.push(`remoteAsOf: ${status.remoteAsOf}`);
-            if (status.behindByHours !== undefined) freshness.push(`behindByHours: ${status.behindByHours}`);
-            if (status.lastSyncAt) freshness.push(`lastSyncAt: ${status.lastSyncAt}`);
-            if (status.lastFullSyncAt) freshness.push(`lastFullSyncAt: ${status.lastFullSyncAt}`);
-            if (status.lastIncrementalSyncAt) freshness.push(`lastIncrementalSyncAt: ${status.lastIncrementalSyncAt}`);
-
-            if (status.isSyncing) {
-                const lines = [
-                    `Sync in progress${status.mode ? ` (${status.mode})` : ''}: ${status.progress}% — step: ${status.currentTable ?? 'Initializing'}.`,
-                    'Poll sync_data again soon.',
-                ];
-                if (decisionLine) lines.push(decisionLine);
-                if (freshness.length) lines.push(...freshness);
-                return { content: [{ type: 'text', text: lines.join('\n') }] };
-            }
-
-            const lines: string[] = [];
-            if (decisionLine) lines.push(decisionLine);
-            if (freshness.length) lines.push(...freshness);
-            if (lines.length === 0) {
-                lines.push(launched ? 'Sync triggered.' : 'Sync already in progress.');
-            }
-            return { content: [{ type: 'text', text: lines.join('\n') }] };
-        }
-
-        if (name === 'list_sample_queries') {
-            const filter: { category?: any; name?: string } = {};
-            if (args?.category !== undefined) filter.category = args.category as any;
-            if (args?.name !== undefined) filter.name = args.name as string;
-            const result = listSampleQueries(Object.keys(filter).length > 0 ? filter : undefined);
-            return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-        }
-
-        if (name === 'describe_schema') {
-            const db = openDb();
-            try {
-                const result = describeSchema(db, args?.tables as string[] | undefined);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            } finally { db.close(); }
-        }
-
-        if (name === 'describe_tool') {
-            const toolName = args?.name as string | undefined;
-            if (!toolName) {
-                return { content: [{ type: 'text', text: 'Error: missing required argument `name`.' }] };
-            }
-            const doc = TOOL_DOCS[toolName];
-            if (!doc) {
-                return { content: [{ type: 'text', text: `Unknown tool: ${toolName}. Call tools/list for available tools.` }] };
-            }
-            return { content: [{ type: 'text', text: doc.fullDescription.trim() }] };
-        }
-
-        if (name === 'explain_query') {
-            const db = openDb();
-            try {
-                const plan = explainQuery(db, args?.sql as string);
-                return { content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }] };
-            } finally { db.close(); }
-        }
-
-        if (name === 'execute_sql') {
-            const sql = args?.sql as string;
-            const limit = (args?.limit as number) ?? 100;
-            try {
-                const result = await executeSqlWithTimeout(dbPath, sql, limit, 25_000);
-
-                // Cache results for potential KML export if geospatial data detected
-                let resultId: string | undefined;
-                if (result.rowCount > 0 && hasGeospatialData(result.columns)) {
-                    resultId = cacheResult(result.columns, result.rows);
-                }
-
-                const response: any = { ...result };
-                if (resultId) {
-                    response.result_id = resultId;
-                    response._hints = [{
-                        tool: 'export_kml',
-                        args: { result_id: resultId },
-                        why: 'render geospatially',
-                    }];
-                }
-
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
-            } catch (err: any) {
-                return {
-                    content: [{ type: 'text', text: `SQL Error: ${err.message}` }],
-                    isError: true,
-                };
-            }
-        }
-
-        if (name === 'export_kml') {
-            const id = args?.result_id as string;
-            if (!id) {
-                return {
-                    content: [{ type: 'text', text: 'Missing required parameter: result_id' }],
-                    isError: true,
-                };
-            }
-            const entry = resultCache.get(id);
-            if (!entry) {
-                return {
-                    content: [{ type: 'text', text: `Result not found or expired (result_id: ${id}). Please re-run the original query to get a fresh result_id.` }],
-                    isError: true,
-                };
-            }
-            const kml = generateKml(entry.columns, entry.rows);
-            return {
-                content: [{ type: 'text', text: kml }]
-            };
-        }
-
-        if (name === 'get_frequency_allocation') {
-            const freq_hz = args?.freq_hz as number;
-            const include_footnotes = args?.include_footnotes !== false;  // default true
-            if (typeof freq_hz !== 'number' || !Number.isFinite(freq_hz) || freq_hz <= 0) {
-                return { content: [{ type: 'text', text: JSON.stringify({ _error: 'freq_hz must be a positive number (Hz).' }, null, 2) }] };
-            }
-            const db = openDb();
-            try {
-                const tableCount = (db.prepare('SELECT COUNT(*) AS n FROM spectrum_allocations').get() as { n: number }).n;
-                if (tableCount === 0) {
-                    return { content: [{ type: 'text', text: JSON.stringify({ _error: "Spectrum plan data not loaded. Run 'npm run import-spectrum-plan -- --reseed'." }, null, 2) }] };
-                }
-                const result: any = lookupFrequencyAllocation(db, freq_hz, include_footnotes);
-
-                // Staleness warning
-                const warnings: string[] = [];
-                const publishedRaw = result.source.published_date;
-                if (publishedRaw) {
-                    const pub = new Date(publishedRaw);
-                    if (!Number.isNaN(pub.getTime())) {
-                        const ageMs = Date.now() - pub.getTime();
-                        const ageYears = ageMs / (1000 * 60 * 60 * 24 * 365.25);
-                        if (ageYears >= 3) {
-                            if (result.source.last_patch_date) {
-                                warnings.push(`Spectrum plan base from ${publishedRaw}; last patched ${result.source.last_patch_date}. Verify against the current legislation for licensing decisions.`);
-                            } else {
-                                warnings.push(`Spectrum plan base data is ${Math.floor(ageYears)} years old (published ${publishedRaw}); not patched. Verify against the current legislation for licensing decisions.`);
-                            }
-                        }
-                    }
-                }
-                if (result.match_count === 0) {
-                    warnings.push('No allocation found in the Australian Radiofrequency Spectrum Plan for this frequency.');
-                } else if (result.match_count > 1) {
-                    warnings.push(`${result.match_count} overlapping allocations matched; the plan should not contain overlaps - verify recent patches.`);
-                }
-                if (warnings.length > 0) {
-                    result._warning = warnings.join(' ');
-                }
-
-                if (result.match_count > 0) {
-                    result._hints = [
-                        { tool: 'search_licences', why: 'find licences operating in this band' },
-                        { tool: 'search_application_text', why: "search application text for this band's usage" },
-                    ];
-                }
-
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            } finally { if (db.open) db.close(); }
-        }
-
-        if (name === 'decode_emission_designator') {
-            const code = args?.code as string;
-            if (typeof code !== 'string') {
-                return { content: [{ type: 'text', text: JSON.stringify({ _error: 'code must be a string.' }, null, 2) }] };
-            }
-            const decoded = decodeEmissionDesignator(code);
-            const response: any = { ...decoded };
-            if (decoded.valid) {
-                response._hints = [
-                    {
-                        tool: 'search_devices_by_emission',
-                        args: { modulation: decoded.modulation!.code, info_type: decoded.info_type!.code },
-                        why: 'find every device using this same emission pattern',
-                    },
-                    {
-                        tool: 'execute_sql',
-                        why: 'aggregate device counts by this emission code',
-                    },
-                ];
-            }
-            return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
-        }
-
-        if (name === 'search_devices_by_emission') {
-            const db = openDb();
-            try {
-                const result = searchDevicesByEmission(db, (args ?? {}) as any);
-                const response: any = { ...result };
-                if (!result._error && result.rows.length > 0) {
-                    const first = result.rows[0]!;
-                    response._hints = [
-                        { tool: 'get_licence_details', args: { licence_no: first.LICENCE_NO }, why: 'open the first matching licence' },
-                        { tool: 'decode_emission_designator', args: { code: first.EMISSION.trim() }, why: 'full breakdown of any returned EMISSION value' },
-                        { tool: 'execute_sql', why: 'aggregate or refine these results' },
-                    ];
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
-            } finally { if (db.open) db.close(); }
-        }
-
-        return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
-    });
-
-    return server;
+  return server;
 }
-
-// ─── HTTP Server ─────────────────────────────────────────────────────────────
-
-const transports = new Map<string, StreamableHTTPServerTransport>();
 
 async function main() {
-    // Ensure the schema is current. CREATE TABLE IF NOT EXISTS is idempotent,
-    // so this is safe on existing DBs and adds any tables that landed in
-    // later releases (e.g. an older sync'd DB pulling a new spectrum_* table).
-    initializeDatabase(dbPath);
+  initializeDatabase(dbPath);
+  const app = express();
+  app.use(express.json());
 
-    const app = express();
-    app.use(express.json());
-
-    // Liveness/readiness probe.
-    //   GET /health           → fast: returns sync provenance only; never opens the DB
-    //   GET /health?deep=1    → readiness: also opens the DB read-only and runs a
-    //                           SELECT COUNT(*) on the meta table; 500 if it fails
-    app.get('/health', (req, res) => {
-        const status = getSyncStatus();
-        const body: Record<string, unknown> = {
-            status: 'ok',
-            version: '1.10.0',
-            ...(status.dataAsOf !== undefined ? { dataAsOf: status.dataAsOf } : {}),
-            ...(status.lastSyncAt !== undefined ? { lastSyncAt: status.lastSyncAt } : {}),
-            ...(status.remoteAsOf !== undefined ? { remoteAsOf: status.remoteAsOf } : {}),
-            ...(status.behindByHours !== undefined ? { behindByHours: status.behindByHours } : {}),
-            isSyncing: status.isSyncing,
-        };
-        if (req.query.deep === '1') {
-            try {
-                const db = new Database(dbPath, { readonly: true, fileMustExist: true });
-                try {
-                    db.prepare('SELECT COUNT(*) AS n FROM meta').get();
-                    body.db = 'reachable';
-                } finally {
-                    if (db.open) db.close();
-                }
-            } catch (e) {
-                body.status = 'degraded';
-                body.db = 'unreachable';
-                body.dbError = (e as Error).message;
-                return res.status(500).json(body);
-            }
-        }
-        res.json(body);
-    });
-
-    app.all('/mcp', async (req, res) => {
-        log.debug(`[NETWORK] ${req.method} | session=${req.headers['mcp-session-id'] ?? 'none'}`);
-
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
-        // Route to existing session
-        if (sessionId && transports.has(sessionId)) {
-            try {
-                await transports.get(sessionId)!.handleRequest(req, res, req.body);
-            } catch (err: any) {
-                log.error('[MCP] Transport error:', err.message);
-                if (!res.headersSent) res.status(500).json({ error: err.message });
-            }
-            return;
-        }
-
-        // New session — only POST initialize can start one
-        if (req.method === 'POST') {
-            const transport = new StreamableHTTPServerTransport({
-                sessionIdGenerator: () => randomUUID(),
-                onsessioninitialized: (newId) => {
-                    transports.set(newId, transport);
-                    log.info(`[SESSION] Opened: ${newId}`);
-                },
-            });
-
-            transport.onclose = () => {
-                if (transport.sessionId) {
-                    transports.delete(transport.sessionId);
-                    log.info(`[SESSION] Closed: ${transport.sessionId}`);
-                }
-            };
-
-            await createServer().connect(transport as any);
-
-            try {
-                await transport.handleRequest(req, res, req.body);
-            } catch (err: any) {
-                log.error('[MCP] Init error:', err.message);
-                if (!res.headersSent) res.status(500).json({ error: err.message });
-            }
-            return;
-        }
-
-        res.status(400).json({
-            error: 'Send POST /mcp with initialize to start a session first.',
-        });
-    });
-
-    const port = Number(PORT);
-    const httpServer = app.listen(port, '0.0.0.0', () => {
-        log.info(`ACMA RRL MCP Server v1.10.0 running on port ${port} at http://localhost:${port}/mcp`);
-        log.info('Tools: search_licences, get_licence_details, search_sites, get_site_details, search_clients, sync_data, execute_sql, list_sample_queries, export_kml, search_bsl, search_spectrum_band, search_application_text, get_frequency_allocation, describe_schema, describe_tool, explain_query, decode_emission_designator, search_devices_by_emission');
-    });
-
-    // Graceful shutdown on SIGTERM (systemd / docker stop) and SIGINT (Ctrl-C).
-    // Closes MCP transports, stops accepting new connections, finishes in-flight
-    // requests, then exits. A 30s watchdog hard-exits if any handle is stuck.
-    const shutdown = (signal: string) => {
-        log.info(`[SHUTDOWN] Received ${signal}; closing ${transports.size} MCP transport(s) and HTTP server.`);
-        for (const [sessionId, transport] of transports.entries()) {
-            try {
-                transport.close();
-            } catch (e) {
-                log.error(`[SHUTDOWN] Error closing transport ${sessionId}: ${(e as Error).message}`);
-            }
-        }
-        transports.clear();
-        httpServer.close((err) => {
-            if (err) {
-                log.error(`[SHUTDOWN] HTTP server close error: ${err.message}`);
-                process.exit(1);
-            }
-            log.info('[SHUTDOWN] Closed cleanly.');
-            process.exit(0);
-        });
-        setTimeout(() => {
-            log.warn('[SHUTDOWN] Watchdog: forcing exit after 30s grace period.');
-            process.exit(1);
-        }, 30_000).unref();
+  app.get('/health', (req, res) => {
+    const status = getSyncStatus();
+    const body: Record<string, unknown> = {
+      status: 'ok',
+      version: VERSION,
+      isSyncing: status.isSyncing,
+      ...(status.dataAsOf ? { dataAsOf: status.dataAsOf } : {}),
+      ...(status.lastSyncAt ? { lastSyncAt: status.lastSyncAt } : {}),
+      ...(status.remoteAsOf ? { remoteAsOf: status.remoteAsOf } : {}),
+      ...(status.behindByHours !== undefined ? { behindByHours: status.behindByHours } : {}),
     };
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
+
+    if (req.query.deep === '1') {
+      try {
+        const db = openDb();
+        try {
+          db.prepare('SELECT COUNT(*) AS n FROM meta').get();
+          body.db = 'reachable';
+        } finally {
+          db.close();
+        }
+      } catch (errorValue) {
+        body.status = 'degraded';
+        body.db = 'unreachable';
+        body.dbError = errorValue instanceof Error ? errorValue.message : String(errorValue);
+        return res.status(500).json(body);
+      }
+    }
+    res.json(body);
+  });
+
+  app.all('/mcp', async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (sessionId && transports.has(sessionId)) {
+      try {
+        await transports.get(sessionId)!.handleRequest(req, res, req.body);
+      } catch (errorValue) {
+        const message = errorValue instanceof Error ? errorValue.message : String(errorValue);
+        log.error('[MCP] Transport error:', message);
+        if (!res.headersSent) res.status(500).json({ error: message });
+      }
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(400).json({ error: 'Send POST /mcp with initialize to start a session.' });
+    }
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: id => {
+        transports.set(id, transport);
+        log.info(`[SESSION] Opened: ${id}`);
+      },
+    });
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        transports.delete(transport.sessionId);
+        log.info(`[SESSION] Closed: ${transport.sessionId}`);
+      }
+    };
+
+    await createServer().connect(transport as any);
+    try {
+      await transport.handleRequest(req, res, req.body);
+    } catch (errorValue) {
+      const message = errorValue instanceof Error ? errorValue.message : String(errorValue);
+      log.error('[MCP] Init error:', message);
+      if (!res.headersSent) res.status(500).json({ error: message });
+    }
+  });
+
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+    log.info(`ACMA RRL MCP Server v${VERSION} running on port ${PORT} at http://localhost:${PORT}/mcp`);
+    log.info(`Tools: ${Object.keys(TOOL_DOCS).join(', ')}`);
+    log.info(`MCP default_page_size=${DEFAULT_PAGE_SIZE}`);
+  });
+
+  const shutdown = (signal: string) => {
+    log.info(`[SHUTDOWN] Received ${signal}; closing server.`);
+    for (const transport of transports.values()) {
+      try {
+        transport.close();
+      } catch {}
+    }
+    transports.clear();
+    httpServer.close(errorValue => process.exit(errorValue ? 1 : 0));
+    setTimeout(() => process.exit(1), 30_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-// Only auto-run main() when this file is the entry point — not when imported
-// (e.g. tests/network.test.ts imports this module to read TOOL_DOCS).
-// Mirrors the pattern in src/sync.ts.
 if (process.argv[1]?.endsWith('index.ts') || process.argv[1]?.endsWith('index.js')) {
-    main().catch(err => {
-        log.error('Fatal error:', err);
-        process.exit(1);
-    });
+  main().catch(errorValue => {
+    log.error('Fatal error:', errorValue);
+    process.exit(1);
+  });
 }

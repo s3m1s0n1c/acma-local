@@ -1,452 +1,216 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { initializeDatabase } from '../src/db.js';
 import Database from 'better-sqlite3';
 import axios from 'axios';
-import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
-import * as path from 'path';
-import * as fs from 'fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { initializeDatabase } from '../src/db.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const directory = path.dirname(fileURLToPath(import.meta.url));
 
-describe('MCP Network & Sync Integration (Streamable HTTP)', () => {
-    let serverProcess: any;
-    const PORT = 3001;
-    const testDbPath = path.join(__dirname, 'test_mcp.db');
+describe('MCP v2 network integration', () => {
+  const port = 3001;
+  const databasePath = path.join(directory, 'test_mcp_v2.db');
+  let server: ChildProcess;
 
-    beforeAll(async () => {
-        // Ensure a valid (empty) database exists before the server starts
-        if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
-        initializeDatabase(testDbPath);
+  beforeAll(async () => {
+    if (fs.existsSync(databasePath)) fs.unlinkSync(databasePath);
+    initializeDatabase(databasePath);
+    const db = new Database(databasePath);
+    db.exec(`
+      INSERT INTO client (
+        CLIENT_NO, LICENCEE, POSTAL_STREET, POSTAL_SUBURB, POSTAL_STATE, POSTAL_POSTCODE
+      ) VALUES (101, 'Ian Nash', '1 Example Street', 'Newcastle', 'NSW', '2300');
+      INSERT INTO licence (LICENCE_NO, CLIENT_NO) VALUES ('1234567/1', 101);
+      INSERT INTO site (
+        SITE_ID, NAME, STATE, POSTCODE, LATITUDE, LONGITUDE
+      ) VALUES ('S100', 'Mount Example', 'NSW', '2300', -32.9, 151.7);
+      INSERT INTO device_details (
+        SDD_ID, LICENCE_NO, DEVICE_REGISTRATION_IDENTIFIER,
+        FREQUENCY, SITE_ID, CALL_SIGN
+      ) VALUES (5001, '1234567/1', 'DEV-5001', 476425000, 'S100', 'VK2ABC');
+    `);
+    db.close();
 
-        // Seed emission lookup tables so search_devices_by_emission can resolve descriptions.
-        {
-            const seedPath = path.resolve(__dirname, '..', 'seed', 'emissions.sql');
-            const db = new Database(testDbPath);
-            try {
-                const { applyEmissionReseed } = await import('../src/emissions.js');
-                applyEmissionReseed(db, seedPath);
-            } finally { db.close(); }
-        }
-
-        console.log(`Starting server on port ${PORT}...`);
-        serverProcess = spawn('npx', ['tsx', 'src/index.ts'], {
-            env: { ...process.env, PORT: String(PORT), ACMA_DB_PATH: testDbPath },
-            stdio: 'pipe'
-        });
-
-        serverProcess.stderr.on('data', (data: Buffer) => console.error(`[SERVER ERR] ${data}`));
-
-        await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('Server timeout (60s)')), 60000);
-            serverProcess.stderr.on('data', (data: Buffer) => {
-                if (data.toString().includes(`running on port ${PORT}`)) {
-                    clearTimeout(timeout);
-                    resolve(true);
-                }
-            });
-        });
-
-        await axios.get(`http://localhost:${PORT}/health`);
-    }, 90000);
-
-    afterAll(() => {
-        if (serverProcess) serverProcess.kill();
-        if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+    server = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
+      cwd: path.resolve(directory, '..'),
+      env: {
+        ...process.env,
+        PORT: String(port),
+        ACMA_DB_PATH: databasePath,
+        LOG_LEVEL: 'info',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    test('should connect via Streamable HTTP and list tools', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-
-        await client.connect(transport);
-        const tools = await client.listTools();
-
-        expect(tools.tools).toBeDefined();
-        expect(tools.tools.some(t => t.name === 'search_sites')).toBe(true);
-
-        await transport.close();
-    }, 15000);
-
-    test('should report sync progress', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        // Kick off sync (non-awaited) — sync will fail (no network in test) but should start
-        client.callTool({ name: 'sync_data', arguments: {} }).catch(() => { });
-        // Give it a moment to register as in-progress
-        await new Promise(r => setTimeout(r, 2000));
-
-        const secondCall = await client.callTool({ name: 'sync_data', arguments: {} }) as any;
-        const responseText = secondCall.content[0].text;
-        // Either still in progress, triggered, completed, or returned freshness/decision info — all valid
-        expect(responseText).toMatch(/Sync (in progress|triggered|already in progress|failed)|Last decision:|dataAsOf:|lastSyncAt:/i);
-
-        await transport.close();
-    }, 25000);
-
-    test('sync_data accepts mode="full" argument', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const result = await client.callTool({ name: 'sync_data', arguments: { mode: 'full' } }) as any;
-        // Tool must return a content block with non-empty text; no error thrown.
-        expect(result.content).toBeDefined();
-        expect(result.content.length).toBeGreaterThan(0);
-        expect(typeof result.content[0].text).toBe('string');
-        expect(result.content[0].text.length).toBeGreaterThan(0);
-
-        await transport.close();
-    }, 25000);
-
-    test('list_sample_queries bare call returns a category summary with >=45 total entries', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const result = await client.callTool({ name: 'list_sample_queries', arguments: {} }) as any;
-        const summary = JSON.parse(result.content[0].text);
-        expect(Array.isArray(summary)).toBe(false);
-        expect(Array.isArray(summary.categories)).toBe(true);
-        expect(summary.categories.length).toBeGreaterThan(0);
-        const total = summary.categories.reduce((s: number, c: any) => s + c.count, 0);
-        expect(total).toBeGreaterThanOrEqual(45);
-
-        await transport.close();
-    }, 15000);
-
-    test('list_sample_queries filtered by category returns SampleQuery[]', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const result = await client.callTool({ name: 'list_sample_queries', arguments: { category: 'lookup' } }) as any;
-        const queries = JSON.parse(result.content[0].text);
-        expect(Array.isArray(queries)).toBe(true);
-        expect(queries.length).toBeGreaterThan(0);
-        expect(queries[0]).toHaveProperty('description');
-        expect(queries[0]).toHaveProperty('query');
-        expect(queries[0]).toHaveProperty('category', 'lookup');
-
-        await transport.close();
-    }, 15000);
-
-    test('execute_sql runs a valid SELECT and returns structured results', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const result = await client.callTool({
-            name: 'execute_sql',
-            arguments: { sql: "select 1 as num, 'hello' as word" }
-        }) as any;
-        const data = JSON.parse(result.content[0].text);
-        expect(data.columns).toEqual(['num', 'word']);
-        expect(data.rows).toEqual([[1, 'hello']]);
-        expect(data.truncated).toBe(false);
-
-        await transport.close();
-    }, 45000);
-
-    test('execute_sql rejects non-SELECT statements', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const result = await client.callTool({
-            name: 'execute_sql',
-            arguments: { sql: "INSERT INTO client (CLIENT_NO) VALUES (999)" }
-        }) as any;
-        expect(result.isError).toBe(true);
-        expect(result.content[0].text).toMatch(/SELECT/i);
-
-        await transport.close();
-    }, 45000);
-
-    test('describe_tool returns the full markdown for a registered tool', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const result = await client.callTool({ name: 'describe_tool', arguments: { name: 'search_licences' } }) as any;
-        const response = result.content[0].text as string;
-        // The full description must contain section headers absent from the slim catalog summary
-        expect(response).toMatch(/PRIMARY SEARCH TOOL/);
-        expect(response).toMatch(/## Usage/);
-
-        await transport.close();
-    }, 15000);
-
-    test('describe_tool returns error for unknown tool', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const result = await client.callTool({ name: 'describe_tool', arguments: { name: 'nonexistent_tool' } }) as any;
-        const response = (result.content[0].text as string).toLowerCase();
-        expect(response).toMatch(/unknown|not found/);
-
-        await transport.close();
-    }, 15000);
-
-    test('tools/list catalog descriptions are slim summaries (under 200 chars)', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const tools = await client.listTools();
-        for (const tool of tools.tools) {
-            expect(tool.description!.length).toBeLessThan(200);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Server startup timed out.')), 30_000);
+      const onData = (chunk: Buffer) => {
+        if (chunk.toString().includes(`running on port ${port}`)) {
+          clearTimeout(timer);
+          resolve();
         }
+      };
+      server.stderr?.on('data', onData);
+      server.once('exit', code => {
+        clearTimeout(timer);
+        reject(new Error(`Server exited during startup with code ${code}.`));
+      });
+    });
+  }, 45_000);
 
-        await transport.close();
-    }, 15000);
-
-    test('tools/list advertises the full 18-tool catalog', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-
-        const tools = await client.listTools();
-        expect(tools.tools.some(t => t.name === 'describe_tool')).toBe(true);
-        expect(tools.tools.some(t => t.name === 'explain_query')).toBe(true);
-        expect(tools.tools.some(t => t.name === 'get_frequency_allocation')).toBe(true);
-        expect(tools.tools.some(t => t.name === 'decode_emission_designator')).toBe(true);
-        expect(tools.tools.some(t => t.name === 'search_devices_by_emission')).toBe(true);
-        expect(tools.tools.length).toBe(18);
-
-        await transport.close();
-    }, 15000);
-
-    // ─── _hints tests ─────────────────────────────────────────────────────────
-
-    async function callMcpTool(toolName: string, toolArgs: Record<string, unknown>): Promise<string> {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const result = await client.callTool({ name: toolName, arguments: toolArgs }) as any;
-        await transport.close();
-        return result.content[0].text as string;
+  afterAll(async () => {
+    if (server && !server.killed) {
+      server.kill('SIGTERM');
+      await new Promise(resolve => server.once('exit', resolve));
     }
+    if (fs.existsSync(databasePath)) fs.unlinkSync(databasePath);
+  });
 
-    test('search_licences result includes _hints pointing at get_licence_details', async () => {
-        const response = await callMcpTool('search_licences', { query: '1', limit: 1 });
-        const parsed = JSON.parse(response);
-        // Response is now an envelope: { rows, _hints? }
-        expect(Array.isArray(parsed.rows)).toBe(true);
-        if (parsed.rows.length > 0) {
-            expect(parsed._hints).toBeDefined();
-            expect(parsed._hints[0].tool).toBe('get_licence_details');
-            expect(parsed._hints[0].args).toHaveProperty('licence_no');
-        }
-    }, 15000);
+  async function withClient<T>(run: (client: Client) => Promise<T>): Promise<T> {
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`)
+    );
+    const client = new Client(
+      { name: 'integration-test', version: '1.0.0' },
+      { capabilities: {} }
+    );
+    await client.connect(transport);
+    try {
+      return await run(client);
+    } finally {
+      await transport.close();
+    }
+  }
 
-    test('search_sites result includes _hints pointing at get_site_details', async () => {
-        const response = await callMcpTool('search_sites', { query: '2000', limit: 1 });
-        const parsed = JSON.parse(response);
-        expect(Array.isArray(parsed.rows)).toBe(true);
-        if (parsed.rows.length > 0) {
-            expect(parsed._hints).toBeDefined();
-            expect(parsed._hints[0].tool).toBe('get_site_details');
-        }
-    }, 15000);
+  function parsed(result: any): any {
+    return JSON.parse(result.content[0].text);
+  }
 
-    test('search_clients result has no _hints (no follow-up tool)', async () => {
-        const response = await callMcpTool('search_clients', { query: 'Test', limit: 1 });
-        const parsed = JSON.parse(response);
-        // search_clients still returns a flat array OR an envelope without _hints.
-        // Either acceptable — but no _hints field should be present.
-        if (parsed._hints !== undefined) {
-            throw new Error('search_clients should not emit _hints');
-        }
-    }, 15000);
+  function objects(page: any): Array<Record<string, unknown>> {
+    return page.rows.map((row: unknown[]) =>
+      Object.fromEntries(page.columns.map((column: string, index: number) => [column, row[index]]))
+    );
+  }
 
-    // ─── End _hints tests ──────────────────────────────────────────────────────
-
-    // ─── get_frequency_allocation integration tests ───────────────────────────
-
-    test('get_frequency_allocation returns "data not loaded" error when spectrum tables are empty', async () => {
-        // The test DB is initialised but the spectrum_* tables have no rows yet
-        // (the spectrum-plan seed is only auto-applied at the tail of performFullSync,
-        // which doesn't run in this integration setup). The tool should detect this
-        // and return a structured _error envelope rather than an empty array.
-        const response = await callMcpTool('get_frequency_allocation', { freq_hz: 87100000 });
-        const parsed = JSON.parse(response);
-        expect(parsed._error).toBeDefined();
-        expect(parsed._error).toMatch(/spectrum plan data not loaded/i);
-    }, 15000);
-
-    test('get_frequency_allocation returns matching allocation + footnotes after seeding', async () => {
-        // Seed the spectrum tables directly via applyReseed so the next call to
-        // the MCP tool has data to return. We use a tiny fixture rather than
-        // the full seed/spectrum_plan.sql so the test stays fast and offline-safe.
-        const Database = (await import('better-sqlite3')).default;
-        const { applyReseed } = await import('../src/spectrum_plan.js');
-        const fixture = path.join(__dirname, 'fixtures', 'spectrum_plan_smoke.sql');
-        if (!fs.existsSync(path.dirname(fixture))) fs.mkdirSync(path.dirname(fixture), { recursive: true });
-        // New schema: spectrum_allocations(freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json, raw)
-        // services_json: array of { name, primary, inline_footnotes, qualifier? }
-        // footnotes_json: array of footnote ref strings
-        fs.writeFileSync(fixture, `BEGIN TRANSACTION;
-INSERT INTO spectrum_allocations(freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json, raw)
-  VALUES(87000000, 108000000, 'MHz', 42,
-    '[{"name":"BROADCASTING","primary":true,"inline_footnotes":["AUS37"]}]',
-    '["AUS37","5.87"]',
-    'BROADCASTING AUS37');
-INSERT INTO spectrum_australian_footnotes(footnote_ref, footnote_text) VALUES('AUS37', 'AUS37 body.');
-INSERT INTO spectrum_international_footnotes(footnote_ref, footnote_text) VALUES('5.87', '5.87 ITU body.');
-INSERT INTO spectrum_plan_meta VALUES('source_description', 'Smoke fixture');
-INSERT INTO spectrum_plan_meta VALUES('published_date', '2018-01-01');
-COMMIT;
-`);
-        const seedDb = new Database(testDbPath);
-        try {
-            applyReseed(seedDb, fixture);
-        } finally { seedDb.close(); }
-
-        const response = await callMcpTool('get_frequency_allocation', { freq_hz: 87100000 });
-        const parsed = JSON.parse(response);
-        expect(parsed.match_count).toBe(1);
-        // New shape: allocation (singular object) instead of allocations[0]
-        expect(parsed.allocation).toBeDefined();
-        expect(typeof parsed.allocation).toBe('object');
-        expect(parsed.allocation.services[0].name).toBe('BROADCASTING');
-        expect(parsed.allocation.services[0].primary).toBe(true);
-        // regions object with ITU R1/R2/R3 contrast keys
-        expect(parsed.regions).toBeDefined();
-        expect(Object.keys(parsed.regions)).toEqual(expect.arrayContaining(['1', '2', '3']));
-        // resolved_footnotes flat map
-        expect(parsed.resolved_footnotes).toBeDefined();
-        expect(parsed.resolved_footnotes['AUS37']).toBe('AUS37 body.');
-        // match_count is numeric
-        expect(typeof parsed.match_count).toBe('number');
-        // staleness warning fires for 2018-01-01
-        expect(parsed._warning).toMatch(/8 years old|published 2018/);
-        expect(parsed._hints).toBeDefined();
-        expect(parsed._hints.some((h: any) => h.tool === 'search_licences')).toBe(true);
-
-        fs.unlinkSync(fixture);
-    }, 15000);
-
-    // ─── End get_frequency_allocation tests ───────────────────────────────────
-
-    // ─── decode_emission_designator + search_devices_by_emission tests ────────
-
-    test('decode_emission_designator: happy path', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const res = await client.callTool({ name: 'decode_emission_designator', arguments: { code: '16K0F3E' } });
-        const payload = JSON.parse((res.content as any)[0].text);
-        expect(payload.valid).toBe(true);
-        expect(payload.bandwidth.value_hz).toBe(16000);
-        expect(payload.modulation.code).toBe('F');
-        expect(payload.info_type.code).toBe('E');
-        expect(payload._hints.some((h: any) => h.tool === 'search_devices_by_emission' && h.args?.modulation === 'F')).toBe(true);
-        await transport.close();
-    }, 15000);
-
-    test('decode_emission_designator: empty input', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const res = await client.callTool({ name: 'decode_emission_designator', arguments: { code: '' } });
-        const payload = JSON.parse((res.content as any)[0].text);
-        expect(payload.valid).toBe(false);
-        expect(payload.warnings.length).toBeGreaterThan(0);
-        // No _hints key emitted on invalid path.
-        expect(payload._hints).toBeUndefined();
-        await transport.close();
-    }, 15000);
-
-    test('search_devices_by_emission: happy path with seeded fixture', async () => {
-        // The test DB starts empty for device_details; insert two rows so the search has something to find.
-        const fixtureDb = new Database(testDbPath);
-        try {
-            fixtureDb.prepare(`INSERT INTO device_details(SDD_ID, LICENCE_NO, EMISSION, FREQUENCY, SITE_ID) VALUES
-                (9001, 'TEST-L1', '16K0F3E', 150000000, NULL),
-                (9002, 'TEST-L2', '10M0W7D', 2400000000, NULL)`).run();
-        } finally { fixtureDb.close(); }
-
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'F', info_type: 'E' } });
-        const payload = JSON.parse((res.content as any)[0].text);
-        expect(payload._error).toBeUndefined();
-        expect(payload.rows.length).toBeGreaterThanOrEqual(1);
-        expect(payload.rows[0].decoded.modulation_code).toBe('F');
-        expect(payload.rows[0].decoded.info_type_description).toContain('Telephony');
-        expect(payload.resolved_filters.modulation.code).toBe('F');
-        expect(payload._hints?.length).toBeGreaterThan(0);
-        expect(payload._hints.some((h: any) => h.tool === 'decode_emission_designator' && h.args?.code)).toBe(true);
-        await transport.close();
-    }, 20000);
-
-    test('search_devices_by_emission: description-resolution path', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'frequency modulation', info_type: 'telephony' } });
-        const payload = JSON.parse((res.content as any)[0].text);
-        expect(payload._error).toBeUndefined();
-        expect(payload.resolved_filters.modulation.code).toBe('F');
-        expect(payload.resolved_filters.info_type.code).toBe('E');
-        await transport.close();
-    }, 15000);
-
-    test('search_devices_by_emission: ambiguous description returns candidate list', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'sideband' } });
-        const payload = JSON.parse((res.content as any)[0].text);
-        expect(payload._error).toBeDefined();
-        expect(payload._error).toContain('ambiguous');
-        await transport.close();
-    }, 15000);
-
-    test('search_devices_by_emission: no filters returns error', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: {} });
-        const payload = JSON.parse((res.content as any)[0].text);
-        expect(payload._error).toBe('At least one filter is required.');
-        await transport.close();
-    }, 15000);
-
-    test('search_devices_by_emission: unknown code letter returns error', async () => {
-        const transport = new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`));
-        const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
-        await client.connect(transport);
-        const res = await client.callTool({ name: 'search_devices_by_emission', arguments: { modulation: 'Z' } });
-        const payload = JSON.parse((res.content as any)[0].text);
-        expect(payload._error).toContain('Z');
-        await transport.close();
-    }, 15000);
-
-    // ─── End emission tests ───────────────────────────────────────────────────
-
-    test('every advertised tool has a TOOL_DOCS entry', async () => {
-        // Read TOOL_DOCS via dynamic import to avoid module side-effects at file load time.
-        const { TOOL_DOCS } = await import('../src/index');
-        const advertised = [
-            'search_licences', 'get_licence_details', 'search_sites', 'get_site_details',
-            'search_clients', 'search_bsl', 'search_spectrum_band', 'search_application_text',
-            'get_frequency_allocation', 'sync_data', 'list_sample_queries', 'execute_sql',
-            'export_kml', 'describe_schema', 'describe_tool', 'explain_query',
-            'decode_emission_designator', 'search_devices_by_emission',
-        ];
-        for (const name of advertised) {
-            expect(TOOL_DOCS[name]).toBeDefined();
-            expect(TOOL_DOCS[name]!.summary.length).toBeLessThan(200);
-            expect(TOOL_DOCS[name]!.tags.length).toBeGreaterThan(0);
-            expect(TOOL_DOCS[name]!.fullDescription.length).toBeGreaterThan(50);
-        }
+  test('health reports v2 and a reachable database', async () => {
+    const result = await axios.get(`http://127.0.0.1:${port}/health?deep=1`);
+    expect(result.data).toMatchObject({
+      status: 'ok',
+      version: '2.0.0',
+      db: 'reachable',
     });
+  });
+
+  test('advertises only the nine focused tools', async () => {
+    await withClient(async client => {
+      const listed = await client.listTools();
+      expect(listed.tools.map(tool => tool.name)).toEqual([
+        'search_records',
+        'get_record',
+        'search_frequencies',
+        'spectrum_reference',
+        'decode_emission',
+        'database',
+        'get_result_page',
+        'export_kml',
+        'sync_data',
+      ]);
+      for (const tool of listed.tools) {
+        expect(tool.description!.length).toBeLessThan(200);
+      }
+    });
+  });
+
+  test('searches a person and returns their address in one compact call', async () => {
+    await withClient(async client => {
+      const page = parsed(await client.callTool({
+        name: 'search_records',
+        arguments: { query: 'Ian Nash', page_size: 10 },
+      }));
+      const rows = objects(page);
+      expect(rows[0]).toMatchObject({
+        ENTITY_TYPE: 'client',
+        PRIMARY_TEXT: 'Ian Nash',
+        CLIENT_NO: 101,
+        ADDRESS: '1 Example Street, Newcastle, NSW, 2300',
+      });
+      expect(page).not.toHaveProperty('_hints');
+    });
+  });
+
+  test('searches a call sign and returns its holder and address', async () => {
+    await withClient(async client => {
+      const page = parsed(await client.callTool({
+        name: 'search_records',
+        arguments: { query: 'VK2ABC', entity_types: ['callsign'] },
+      }));
+      expect(objects(page)[0]).toMatchObject({
+        CALL_SIGN: 'VK2ABC',
+        LICENCE_NO: '1234567/1',
+        SECONDARY_TEXT: 'Ian Nash',
+        ADDRESS: '1 Example Street, Newcastle, NSW, 2300',
+      });
+    });
+  });
+
+  test('matches 476.425 MHz exactly and reports the interpreted Hz value', async () => {
+    await withClient(async client => {
+      const page = parsed(await client.callTool({
+        name: 'search_frequencies',
+        arguments: { frequency: 476.425, unit: 'auto', tolerance_hz: 0 },
+      }));
+      expect(page.query).toMatchObject({
+        requested_frequency_hz: 476425000,
+        min_hz: 476425000,
+        max_hz: 476425000,
+        exact: true,
+      });
+      expect(objects(page)[0]).toMatchObject({
+        FREQUENCY_HZ: 476425000,
+        DISTANCE_HZ: 0,
+        MATCH_TYPE: 'exact',
+      });
+    });
+  });
+
+  test('reuses identical searches and pages cached data', async () => {
+    await withClient(async client => {
+      const first = parsed(await client.callTool({
+        name: 'search_records',
+        arguments: { query: 'Ian Nash', page_size: 1 },
+      }));
+      const repeated = parsed(await client.callTool({
+        name: 'search_records',
+        arguments: { query: 'Ian Nash', page_size: 1 },
+      }));
+      expect(repeated.result_id).toBe(first.result_id);
+      expect(repeated.duplicate).toBe(true);
+
+      const next = parsed(await client.callTool({
+        name: 'get_result_page',
+        arguments: { result_id: first.result_id, offset: 0, limit: 10 },
+      }));
+      expect(next.total).toBeGreaterThan(0);
+    });
+  });
+
+  test('keeps the advanced database fallback read-only', async () => {
+    await withClient(async client => {
+      const selected = parsed(await client.callTool({
+        name: 'database',
+        arguments: { action: 'query', sql: 'SELECT COUNT(*) AS total FROM client' },
+      }));
+      expect(objects(selected)[0]).toEqual({ total: 1 });
+
+      const rejected = await client.callTool({
+        name: 'database',
+        arguments: { action: 'query', sql: 'DELETE FROM client' },
+      }) as any;
+      expect(rejected.isError).toBe(true);
+      expect(rejected.content[0].text).toMatch(/SELECT|read-only/i);
+    });
+  });
 });
