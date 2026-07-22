@@ -2,32 +2,36 @@
 
 A Model Context Protocol (MCP) server that exposes the Australian Communications and Media Authority (ACMA) [Register of Radiocommunications Licences (RRL)](https://www.acma.gov.au/radiocomms-licence-data) and the [Australian Radiofrequency Spectrum Plan (ARSP)](https://www.acma.gov.au/australian-radiofrequency-spectrum-plan) as a local SQLite mirror, with manifest-driven sync against ACMA's REST API.
 
-The server speaks two transports: **stdio** (Claude Desktop, LM Studio local) and **Streamable HTTP/SSE** on `:3000` (LM Studio 0.3.17+, networked MCP hosts). Both modes share the same 18-tool catalog.
+The server speaks two transports: **stdio** and **Streamable HTTP/SSE** on `:3000`. Version 2 keeps the database and sync pipeline intact while replacing the overlapping MCP catalog with nine focused tools designed for small local models.
 
 ## Features
 
 - **Local mirror** of the full RRL dataset (32 materialised tables + FTS5 narrative index), kept fresh by ACMA's `/v1/Extracts` manifest API — mobile-friendly by default (no automatic 70 MB downloads).
-- **Full-text search** (SQLite FTS5) over application narrative — answers "which licences mention 'remote operation'?" in milliseconds.
+- **One-call record search** across client names and addresses, licence numbers, ABN/ACN, call signs, device identifiers, station names, sites, broadcasting licences and application narrative.
+- **Exact frequency search** with unambiguous Hz/kHz/MHz/GHz parsing. `476.425`, `"476.425 MHz"` and `476425000` all resolve to exactly `476425000` Hz.
+- **Call-sign resolution** joins assignments through licences to the holder name and full postal address in one tool call.
+- **Compact lossless results** use columnar rows, paging, duplicate-call reuse and minified JSON to reduce local-model prompt processing.
+- **Full-text search** (SQLite FTS5) over application narrative.
 - **Geospatial export** — site/device results carry coordinates and can be rendered as KML via `export_kml`.
-- **Spectrum plan lookup** — `get_frequency_allocation(freq_hz)` returns the AU primary allocation plus ITU Region 1/2/3 contrast rows and resolved footnote text. Data rebuilt from the 2021 ACMA Spectrum Plan PDF; seeded from `seed/spectrum_plan.sql`.
-- **Power-user SQL** — `execute_sql` runs sandboxed SELECT/WITH queries in a worker thread; `explain_query`, `describe_schema`, and `list_sample_queries` make the schema discoverable.
-- **Progressive disclosure** — `tools/list` returns terse one-liners; `describe_tool(<name>)` fetches the full markdown when needed (matterfront pattern).
+- **Spectrum plan lookup** — `spectrum_reference` returns the AU primary allocation plus ITU Region 1/2/3 contrast rows and optional resolved footnote text.
+- **Power-user fallback** — `database` can inspect the schema or run a sandboxed read-only SELECT/WITH query when a specialised search cannot answer the question.
+- **Search metrics** — every MCP call logs database time, row count, response bytes and cache status.
 
-## Tools (18)
+## Tools (9)
 
-| Group | Tools |
+| Tool | Purpose |
 |---|---|
-| **Search** (find records by name/ID) | `search_licences`, `search_sites`, `search_clients`, `search_bsl`, `search_devices_by_emission` |
-| **Detail lookups** | `get_licence_details`, `get_site_details` |
-| **Spectrum & narrative** | `search_spectrum_band`, `search_application_text`, `get_frequency_allocation` |
-| **SQL backend** | `execute_sql`, `list_sample_queries`, `explain_query` |
-| **Output** | `export_kml` (geospatial render of cached results) |
-| **Meta / orchestration** | `sync_data`, `describe_schema`, `describe_tool`, `decode_emission_designator` |
+| `search_records` | Ranked search across names, addresses, clients, licences, call signs, device IDs, sites, broadcasts and application text. |
+| `get_record` | Open a result and include linked licences or assignments. |
+| `search_frequencies` | Exact/ranged assignment and spectrum-authorisation search with Hz, kHz, MHz and GHz input. |
+| `spectrum_reference` | Australian and ITU spectrum-plan lookup. |
+| `decode_emission` | Decode an ITU/ACA emission designator such as `16K0F3E`. |
+| `database` | Schema inspection and advanced read-only SQL fallback. |
+| `get_result_page` | Retrieve another cached page without rerunning SQLite. |
+| `export_kml` | Render cached latitude/longitude results as KML. |
+| `sync_data` | Check status or start an automatic/full sync. |
 
-- `search_devices_by_emission` — Find devices/licences by decoded emission descriptor (modulation, info type, etc.). Accepts code letters or descriptions.
-- `decode_emission_designator` — Decode an ITU/ACA emission designator (e.g. 16K0F3E) into structured bandwidth/modulation/info fields.
-
-Search-style results return an `_hints` array suggesting plausible follow-up tools (e.g. `search_licences` → `get_licence_details`; geospatial results → `export_kml`).
+Search responses contain `columns` and `rows`, plus a `result_id` for paging. Automatic `_hints` are intentionally not returned.
 
 ## Installation
 
@@ -98,6 +102,7 @@ Environment variables:
 | `ACMA_DB_PATH` | Absolute path to the SQLite DB. Default `./data/acma.db`. |
 | `PORT` | HTTP server port for the Streamable HTTP transport. Default `3000`. |
 | `LOG_LEVEL` | One of `error` / `warn` / `info` (default) / `debug`. Lower levels are emitted; everything else is suppressed. |
+| `MCP_DEFAULT_PAGE_SIZE` | Rows returned by the first search page. Default `10`, maximum `100`. |
 | `DEBUG_NETWORK` | Legacy alias for `LOG_LEVEL=debug` (kept for backwards compatibility). Promotes per-request `[NETWORK]` logging when set. |
 
 The server's `/health` endpoint returns JSON with sync provenance (`dataAsOf`, `lastSyncAt`, `remoteAsOf`, `behindByHours`, `isSyncing`). Pass `?deep=1` to additionally probe the DB read-only — returns `500` with `status: degraded` if the DB is unreachable.

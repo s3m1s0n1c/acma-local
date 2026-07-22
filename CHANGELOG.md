@@ -2,7 +2,24 @@
 
 All notable changes to this project are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-07-22
+
+### Changed
+- Replaced the overlapping 18-tool MCP catalog with nine focused tools for faster and more reliable local-model tool selection.
+- Added ranked one-call search across clients, holder/trading names, postal addresses, licences, call signs, device identifiers, station names, sites, broadcasts and application narrative.
+- Call-sign results now include the linked licence, holder name and full postal address without a model-driven lookup chain.
+- Frequency input now accepts Hz, kHz, MHz and GHz. In auto mode, `476.425` is treated as MHz while `476425000` is treated as Hz; exact searches never silently return a nearby frequency.
+- Search and SQL results are minified, lossless columnar pages cached for 30 minutes. Identical calls reuse the same `result_id`.
+- Removed automatic `_hints` from tool responses.
+- Added per-call logs for elapsed database time, rows, output bytes and cache status.
+
+### Added
+- Targeted indexes for frequency, call sign, device registration/former identifiers, EFL identifiers/system and station name.
+- Regression and live MCP tests covering name/address search, call signs, exact `476.425 MHz` matching, Hz input, result paging and duplicate-call caching.
+
+### Upgrade notes
+- The first v2 startup creates the new SQLite indexes and may take longer than normal on a full 2.27-million-row database. Later starts use the existing indexes.
+- Existing RRL data and table relationships are unchanged.
 
 ### Added
 - **`LOG_LEVEL` env var** (`error` / `warn` / `info` (default) / `debug`). All in-source logging goes through `src/logger.ts`; lower levels suppress noisier ones. `DEBUG_NETWORK` kept as a legacy alias.
