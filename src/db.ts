@@ -17,6 +17,10 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
       CREATE INDEX IF NOT EXISTS client_client_cat_idx ON client(CAT_ID);
       CREATE INDEX IF NOT EXISTS client_client_fee_idx ON client(FEE_STATUS_ID);
       CREATE INDEX IF NOT EXISTS client_client_licencee_comp_idx ON client(CLIENT_NO, LICENCEE);
+      CREATE INDEX IF NOT EXISTS client_licencee_search_idx ON client(LICENCEE COLLATE NOCASE);
+      CREATE INDEX IF NOT EXISTS client_trading_search_idx ON client(TRADING_NAME COLLATE NOCASE);
+      CREATE INDEX IF NOT EXISTS client_abn_search_idx ON client(ABN COLLATE NOCASE);
+      CREATE INDEX IF NOT EXISTS client_acn_search_idx ON client(ACN COLLATE NOCASE);
     `
   },
   "licence": {
@@ -56,6 +60,7 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
       CREATE INDEX IF NOT EXISTS site_state_idx ON site(STATE);
       CREATE INDEX IF NOT EXISTS site_postcode_idx ON site(POSTCODE);
       CREATE INDEX IF NOT EXISTS site_lic_area_idx ON site(LICENSING_AREA_ID);
+      CREATE INDEX IF NOT EXISTS site_name_search_idx ON site(NAME COLLATE NOCASE);
     `
   },
   "device_details": {
@@ -88,6 +93,25 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
       CREATE INDEX IF NOT EXISTS device_details_licence_no_idx ON device_details(LICENCE_NO);
       CREATE INDEX IF NOT EXISTS device_details_efl_idx ON device_details(EFL_ID);
       CREATE INDEX IF NOT EXISTS device_details_related_efl_idx ON device_details(RELATED_EFL_ID);
+      CREATE INDEX IF NOT EXISTS device_details_frequency_search_idx ON device_details(FREQUENCY);
+      CREATE INDEX IF NOT EXISTS device_details_callsign_search_idx
+        ON device_details(CALL_SIGN COLLATE NOCASE)
+        WHERE CALL_SIGN IS NOT NULL AND CALL_SIGN <> '';
+      CREATE INDEX IF NOT EXISTS device_details_registration_search_idx
+        ON device_details(DEVICE_REGISTRATION_IDENTIFIER COLLATE NOCASE)
+        WHERE DEVICE_REGISTRATION_IDENTIFIER IS NOT NULL AND DEVICE_REGISTRATION_IDENTIFIER <> '';
+      CREATE INDEX IF NOT EXISTS device_details_former_search_idx
+        ON device_details(FORMER_DEVICE_IDENTIFIER COLLATE NOCASE)
+        WHERE FORMER_DEVICE_IDENTIFIER IS NOT NULL AND FORMER_DEVICE_IDENTIFIER <> '';
+      CREATE INDEX IF NOT EXISTS device_details_efl_freq_search_idx
+        ON device_details(EFL_FREQ_IDENT COLLATE NOCASE)
+        WHERE EFL_FREQ_IDENT IS NOT NULL AND EFL_FREQ_IDENT <> '';
+      CREATE INDEX IF NOT EXISTS device_details_efl_system_search_idx
+        ON device_details(EFL_SYSTEM COLLATE NOCASE)
+        WHERE EFL_SYSTEM IS NOT NULL AND EFL_SYSTEM <> '';
+      CREATE INDEX IF NOT EXISTS device_details_station_name_search_idx
+        ON device_details(STATION_NAME COLLATE NOCASE)
+        WHERE STATION_NAME IS NOT NULL AND STATION_NAME <> '';
     `
   },
   "antenna": {
@@ -159,6 +183,7 @@ export const TABLE_METADATA: Record<string, { ddl: string; post_load_ddl?: strin
     "post_load_ddl": `
       CREATE INDEX IF NOT EXISTS bsl_bsl_no_idx ON bsl(BSL_NO);
       CREATE INDEX IF NOT EXISTS bsl_call_sign_idx ON bsl(CALL_SIGN);
+      CREATE INDEX IF NOT EXISTS bsl_call_sign_search_idx ON bsl(CALL_SIGN COLLATE NOCASE);
       CREATE INDEX IF NOT EXISTS bsl_on_air_id_idx ON bsl(ON_AIR_ID);
       CREATE INDEX IF NOT EXISTS bsl_area_code_idx ON bsl(AREA_CODE);
     `
